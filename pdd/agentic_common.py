@@ -1411,6 +1411,8 @@ def _create_provider_attempt_receipt(
 ) -> ProviderAttemptReceipt:
     """Classify complete private provider evidence into a closed safe receipt."""
     safe_provider = _provider_attempt_name(provider)
+    stdout_text = raw_stdout if isinstance(raw_stdout, str) else ""
+    stderr_text = raw_stderr if isinstance(raw_stderr, str) else ""
     if timed_out:
         return _new_provider_attempt_receipt(
             safe_provider, attempt_number, "transport", "ambiguous"
@@ -1421,19 +1423,32 @@ def _create_provider_attempt_receipt(
         )
 
     try:
-        parsed = json.loads((raw_stdout or "").strip())
+        parsed = json.loads(stdout_text.strip())
     except (json.JSONDecodeError, TypeError, ValueError):
+        combined_text = "\n".join(
+            part for part in (stdout_text, stderr_text) if part
+        )
         reset_like = bool(
             re.search(
                 r"\b(?:connection\s+reset|broken\s+pipe|timed?\s*out)\b",
-                raw_stderr or "",
+                stderr_text,
                 re.I,
             )
         )
+        if safe_provider == "anthropic" and _ANTHROPIC_CREDENTIAL_ERROR_RE.search(
+            combined_text
+        ):
+            unstructured_kind: ProviderFailureKind = "credential_or_account"
+        elif re.search(r"\b(?:HTTP\s*)?429\b", combined_text, re.I):
+            unstructured_kind = "provider_limit"
+        elif reset_like:
+            unstructured_kind = "transport"
+        else:
+            unstructured_kind = "unknown"
         return _new_provider_attempt_receipt(
             safe_provider,
             attempt_number,
-            "transport" if reset_like else "unknown",
+            unstructured_kind,
             "ambiguous",
         )
 
@@ -1487,10 +1502,17 @@ def _create_provider_attempt_receipt(
 def _public_provider_failure_detail(
     receipt: ProviderAttemptReceipt,
     returncode: Optional[int],
+    unstructured_detail: str = "",
 ) -> str:
     """Create a PDD-owned diagnostic without copying private provider bytes."""
+    if unstructured_detail and not unstructured_detail.lstrip().startswith(("{", "[")):
+        exit_detail = f"Exit code {returncode}: " if returncode is not None else ""
+        return _sanitize_comment_body(
+            f"{exit_detail}{unstructured_detail}",
+            max_chars=MAX_ERROR_SNIPPET_LENGTH,
+        )
     if receipt.failure_kind == "credential_or_account":
-        reason = "authentication or account access failure (auth)"
+        reason = "Authentication failed or account access was denied (auth)"
     elif receipt.failure_kind == "provider_limit":
         reason = "provider limit (HTTP 429)"
     elif receipt.failure_kind == "transport":
@@ -1498,7 +1520,7 @@ def _public_provider_failure_detail(
     elif receipt.failure_kind == "provider_error":
         reason = "structured provider failure"
     else:
-        reason = "unclassified provider failure"
+        reason = "Invalid JSON output or unclassified provider failure"
     exit_detail = f" with exit code {returncode}" if returncode is not None else ""
     return _sanitize_comment_body(
         f"Provider {receipt.provider}{exit_detail}: {reason}.", max_chars=500
@@ -8728,11 +8750,16 @@ def _run_with_provider(
                 private_stderr,
                 output_complete=output_complete,
             )
+            unstructured_detail = private_stderr or private_stdout
             if provider == "openai":
                 if result_is_spooled:
+                    stdout_error = _extract_codex_jsonl_error_from_lines(
+                        _iter_spooled_lines(result.stdout_file)
+                    )
                     stderr_snippet = result.stderr_head + result.stderr_tail
                     stdout_snippet = result.stdout_head + result.stdout_tail
                 else:
+                    stdout_error = _extract_codex_jsonl_error(result.stdout or "")
                     stderr_snippet = result.stderr or ""
                     stdout_snippet = (result.stdout or "")[:MAX_ERROR_SNIPPET_LENGTH]
                 combined_error = "\n".join(
@@ -8746,16 +8773,36 @@ def _run_with_provider(
                         "credential_or_account",
                         "ambiguous",
                     )
+                    public_codex_error = _sanitize_comment_body(
+                        codex_auth_message,
+                        max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                    )
+                elif stdout_error:
+                    public_codex_error = _sanitize_comment_body(
+                        f"Exit code {result.returncode}: {stdout_error}",
+                        max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                    )
+                elif stderr_snippet and not _is_codex_stdin_notice(stderr_snippet):
+                    public_codex_error = _sanitize_comment_body(
+                        f"Exit code {result.returncode}: {stderr_snippet}",
+                        max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                    )
+                else:
+                    public_codex_error = _public_provider_failure_detail(
+                        receipt, result.returncode
+                    )
                 return _ProviderRunResult(
                     False,
-                    _public_provider_failure_detail(receipt, result.returncode),
+                    public_codex_error,
                     0.0,
                     None,
                     provider_attempt_receipt=receipt,
                 )
             return _ProviderRunResult(
                 False,
-                _public_provider_failure_detail(receipt, result.returncode),
+                _public_provider_failure_detail(
+                    receipt, result.returncode, unstructured_detail
+                ),
                 0.0,
                 None,
                 provider_attempt_receipt=receipt,
@@ -8920,13 +8967,25 @@ def _run_with_provider(
                     if not success
                     else None
                 )
+                if receipt is not None and not isinstance(data, dict):
+                    public_text = (
+                        "Error parsing anthropic JSON: response was not an object"
+                    )
+                elif receipt is not None:
+                    provider_detail = data.get("result")
+                    if isinstance(provider_detail, str) and provider_detail:
+                        public_text = _sanitize_comment_body(
+                            provider_detail, max_chars=MAX_ERROR_SNIPPET_LENGTH
+                        )
+                    else:
+                        public_text = _public_provider_failure_detail(
+                            receipt, result.returncode
+                        )
+                else:
+                    public_text = text
                 return _ProviderRunResult(
                     success,
-                    (
-                        _public_provider_failure_detail(receipt, result.returncode)
-                        if receipt is not None
-                        else text
-                    ),
+                    public_text,
                     cost,
                     actual_model,
                     _extract_anthropic_standard_usage(
@@ -8963,11 +9022,21 @@ def _run_with_provider(
                 "" if result_is_spooled else (result.stderr or ""),
                 output_complete=not result_is_spooled,
             )
+            invalid_stdout = "" if result_is_spooled else (result.stdout or "")
+            if isinstance(invalid_stdout, str) and not invalid_stdout.lstrip().startswith(
+                ("{", "[")
+            ):
+                public_invalid_json = _sanitize_comment_body(
+                    f"Invalid JSON output: {invalid_stdout}",
+                    max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                )
+            else:
+                public_invalid_json = _public_provider_failure_detail(
+                    receipt, getattr(result, "returncode", None)
+                )
             return _ProviderRunResult(
                 False,
-                _public_provider_failure_detail(
-                    receipt, getattr(result, "returncode", None)
-                ),
+                public_invalid_json,
                 0.0,
                 None,
                 provider_attempt_receipt=receipt,
@@ -10101,6 +10170,10 @@ _SECRET_PATTERNS: Tuple[Tuple["re.Pattern[str]", str], ...] = (
 
 _ENV_TOKEN_RE    = re.compile(r"\b(GH_TOKEN|GITHUB_TOKEN)\s*=\s*\S+")
 _BEARER_TOKEN_RE = re.compile(r"(Authorization:\s*Bearer\s+)\S+", re.IGNORECASE)
+_PRIVATE_UUID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
 
 _COMMENT_MAX_CHARS = 25_000
 _TRUNCATED_MARKER = "\n\n…[truncated]"
@@ -10272,6 +10345,7 @@ def _sanitize_comment_body(
         redacted = pat.sub(repl, redacted)
     redacted = _ENV_TOKEN_RE.sub(lambda m: f"{m.group(1)}=[REDACTED]", redacted)
     redacted = _BEARER_TOKEN_RE.sub(lambda m: f"{m.group(1)}[REDACTED]", redacted)
+    redacted = _PRIVATE_UUID_RE.sub("[REDACTED_PRIVATE_ID]", redacted)
     if len(redacted) > max_chars:
         # Reserve room for the marker so the returned length never exceeds the
         # caller-supplied cap (codex review of PR #966). When max_chars is
