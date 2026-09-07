@@ -476,7 +476,7 @@ def test_false_positive_work_and_provider_environment_fail_closed(tmp_path):
             "Provider runtime requires interactive configuration.",
             0,
             None,
-            provider_environment_reason="trust_confirmation",
+            provider_environment_reason="trust_prompt",
         ),
     ):
         environment = ac.run_agentic_task(
@@ -487,6 +487,6 @@ def test_false_positive_work_and_provider_environment_fail_closed(tmp_path):
         )
     assert environment.provider_environment_failure == (
         "anthropic",
-        "trust_confirmation",
+        "trust_prompt",
     )
     assert environment.provider_attempt_receipt.work_disposition == "ambiguous"

@@ -66,6 +66,12 @@ ClaudePolicy = Dict[str, Any]
 UsageSource = str
 _HARNESS_CAPABILITIES_CACHE: Optional[Dict[str, Any]] = None
 TaskClass = Literal["single_file", "multi_file", "repo_scale", "high_isolation"]
+ProviderWorkDisposition = Literal[
+    "not_started", "started_or_billable", "ambiguous"
+]
+ProviderFailureKind = Literal[
+    "credential_or_account", "provider_limit", "provider_error", "transport", "unknown"
+]
 _FILESYSTEM_POLICY_KEYS: Tuple[str, str] = ("writableRoots", "readOnlyRoots")
 _PROVIDER_FAILURE_SINK_ENV = "PDD_PROVIDER_FAILURE_SINK"
 _PROVIDER_FAILURE_TOKEN_ENV = "PDD_PROVIDER_FAILURE_TOKEN"
@@ -1241,6 +1247,264 @@ class TokenMatch:
         return True
 
 
+@dataclass(frozen=True)
+class ProviderAttemptReceipt:
+    """Bounded PDD-owned evidence summary for one failed provider attempt."""
+
+    schema_version: str
+    provider: str
+    attempt_number: int
+    failure_kind: ProviderFailureKind
+    work_disposition: ProviderWorkDisposition
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the closed, JSON-serializable public receipt shape."""
+        return {
+            "schema_version": self.schema_version,
+            "provider": self.provider,
+            "attempt_number": self.attempt_number,
+            "failure_kind": self.failure_kind,
+            "work_disposition": self.work_disposition,
+        }
+
+
+_PROVIDER_ATTEMPT_SCHEMA_VERSION = "pdd.provider_attempt.v1"
+_PROVIDER_ATTEMPT_PROVIDERS = frozenset(
+    {"anthropic", "google", "openai", "opencode"}
+)
+_ANTHROPIC_CREDENTIAL_ERROR_RE = re.compile(
+    r"\b(?:authenticat(?:e|ion)|unauthori[sz]ed|login|log\s+in|"
+    r"organization\s+does\s+not\s+have\s+access|account\s+access)\b",
+    re.IGNORECASE,
+)
+
+
+def _provider_attempt_name(provider: str) -> str:
+    normalized = str(provider or "").strip().lower()
+    return normalized if normalized in _PROVIDER_ATTEMPT_PROVIDERS else "unknown"
+
+
+def _is_exact_zero(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and value == 0
+
+
+def _is_positive_number(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0
+
+
+def _nested_value(data: Mapping[str, Any], path: Tuple[str, ...]) -> Any:
+    current: Any = data
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+_ANTHROPIC_ZERO_NUMBER_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("total_cost_usd",),
+    ("duration_api_ms",),
+    ("queued_turn_count",),
+    ("usage", "input_tokens"),
+    ("usage", "cache_creation_input_tokens"),
+    ("usage", "cache_read_input_tokens"),
+    ("usage", "output_tokens"),
+    ("usage", "output_tokens_details", "thinking_tokens"),
+    ("usage", "server_tool_use", "web_search_requests"),
+    ("usage", "server_tool_use", "web_fetch_requests"),
+    ("usage", "cache_creation", "ephemeral_1h_input_tokens"),
+    ("usage", "cache_creation", "ephemeral_5m_input_tokens"),
+    ("subagent_stats", "spawned"),
+    ("subagent_stats", "requested", "background"),
+    ("subagent_stats", "requested", "foreground"),
+    ("subagent_stats", "requested", "unset"),
+    ("subagent_stats", "started_in_background"),
+    ("subagent_stats", "max_depth"),
+    ("subagent_stats", "spawned_by_subagents"),
+    ("subagent_stats", "completed"),
+    ("subagent_stats", "failed"),
+    ("subagent_stats", "killed", "parent"),
+    ("subagent_stats", "killed", "user"),
+    ("subagent_stats", "killed", "system"),
+    ("subagent_stats", "refused", "depth_limit"),
+    ("subagent_stats", "refused", "concurrency_limit"),
+    ("subagent_stats", "refused", "budget"),
+)
+
+
+def _anthropic_has_reviewed_activity(data: Mapping[str, Any]) -> bool:
+    """Detect only reviewed Claude work fields; wrapper timing is not work."""
+    if any(
+        _is_positive_number(_nested_value(data, path))
+        for path in _ANTHROPIC_ZERO_NUMBER_PATHS
+    ):
+        return True
+    usage = data.get("usage")
+    if isinstance(usage, Mapping):
+        iterations = usage.get("iterations")
+        if isinstance(iterations, list) and iterations:
+            return True
+    model_usage = data.get("modelUsage")
+    if isinstance(model_usage, Mapping) and bool(model_usage):
+        return True
+    permission_denials = data.get("permission_denials")
+    if isinstance(permission_denials, list) and permission_denials:
+        return True
+    by_type = _nested_value(data, ("subagent_stats", "by_type"))
+    return isinstance(by_type, Mapping) and bool(by_type)
+
+
+def _anthropic_is_complete_zero_work_rejection(data: Mapping[str, Any]) -> bool:
+    """Match the reviewed Claude 2.1.263 pre-inference rejection boundary."""
+    if "provider_attempt_receipt" in data:
+        return False
+    if data.get("type") != "result" or data.get("subtype") != "success":
+        return False
+    if data.get("stop_reason") != "stop_sequence":
+        return False
+    if data.get("is_error") is not True or data.get("terminal_reason") != "api_error":
+        return False
+    status = data.get("api_error_status")
+    if isinstance(status, bool) or status not in {401, 403}:
+        return False
+    if data.get("num_turns") != 1:
+        return False
+    if not all(
+        _is_exact_zero(_nested_value(data, path))
+        for path in _ANTHROPIC_ZERO_NUMBER_PATHS
+    ):
+        return False
+    if data.get("modelUsage") != {} or data.get("permission_denials") != []:
+        return False
+    if _nested_value(data, ("usage", "iterations")) != []:
+        return False
+    if _nested_value(data, ("subagent_stats", "by_type")) != {}:
+        return False
+    detail = data.get("result")
+    return isinstance(detail, str) and bool(_ANTHROPIC_CREDENTIAL_ERROR_RE.search(detail))
+
+
+def _new_provider_attempt_receipt(
+    provider: str,
+    attempt_number: int,
+    failure_kind: ProviderFailureKind,
+    work_disposition: ProviderWorkDisposition,
+) -> ProviderAttemptReceipt:
+    return ProviderAttemptReceipt(
+        schema_version=_PROVIDER_ATTEMPT_SCHEMA_VERSION,
+        provider=_provider_attempt_name(provider),
+        attempt_number=max(1, int(attempt_number)),
+        failure_kind=failure_kind,
+        work_disposition=work_disposition,
+    )
+
+
+def _create_provider_attempt_receipt(
+    provider: str,
+    attempt_number: int,
+    returncode: int,
+    raw_stdout: str,
+    raw_stderr: str,
+    *,
+    output_complete: bool = True,
+    timed_out: bool = False,
+) -> ProviderAttemptReceipt:
+    """Classify complete private provider evidence into a closed safe receipt."""
+    safe_provider = _provider_attempt_name(provider)
+    if timed_out:
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "transport", "ambiguous"
+        )
+    if safe_provider == "unknown" or not output_complete:
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "unknown", "ambiguous"
+        )
+
+    try:
+        parsed = json.loads((raw_stdout or "").strip())
+    except (json.JSONDecodeError, TypeError, ValueError):
+        reset_like = bool(
+            re.search(
+                r"\b(?:connection\s+reset|broken\s+pipe|timed?\s*out)\b",
+                raw_stderr or "",
+                re.I,
+            )
+        )
+        return _new_provider_attempt_receipt(
+            safe_provider,
+            attempt_number,
+            "transport" if reset_like else "unknown",
+            "ambiguous",
+        )
+
+    if not isinstance(parsed, dict):
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "unknown", "ambiguous"
+        )
+
+    if safe_provider == "anthropic":
+        if _anthropic_has_reviewed_activity(parsed):
+            return _new_provider_attempt_receipt(
+                safe_provider, attempt_number, "provider_error", "started_or_billable"
+            )
+        status = parsed.get("api_error_status")
+        detail = parsed.get("result")
+        credential_failure = (
+            parsed.get("type") == "result"
+            and parsed.get("is_error") is True
+            and not isinstance(status, bool)
+            and status in {401, 403}
+            and isinstance(detail, str)
+            and bool(_ANTHROPIC_CREDENTIAL_ERROR_RE.search(detail))
+        )
+        if _anthropic_is_complete_zero_work_rejection(parsed):
+            return _new_provider_attempt_receipt(
+                safe_provider, attempt_number, "credential_or_account", "not_started"
+            )
+        if status == 429:
+            failure_kind: ProviderFailureKind = "provider_limit"
+        elif credential_failure:
+            failure_kind = "credential_or_account"
+        elif parsed.get("is_error") is True:
+            failure_kind = "provider_error"
+        else:
+            failure_kind = "unknown"
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, failure_kind, "ambiguous"
+        )
+
+    # No conclusive-zero schema has been reviewed for these providers. Their
+    # structured failures therefore fail closed instead of borrowing Claude's
+    # field meanings.
+    return _new_provider_attempt_receipt(
+        safe_provider,
+        attempt_number,
+        "provider_error" if returncode != 0 else "unknown",
+        "ambiguous",
+    )
+
+
+def _public_provider_failure_detail(
+    receipt: ProviderAttemptReceipt,
+    returncode: Optional[int],
+) -> str:
+    """Create a PDD-owned diagnostic without copying private provider bytes."""
+    if receipt.failure_kind == "credential_or_account":
+        reason = "authentication or account access failure (auth)"
+    elif receipt.failure_kind == "provider_limit":
+        reason = "provider limit (HTTP 429)"
+    elif receipt.failure_kind == "transport":
+        reason = "provider transport failure"
+    elif receipt.failure_kind == "provider_error":
+        reason = "structured provider failure"
+    else:
+        reason = "unclassified provider failure"
+    exit_detail = f" with exit code {returncode}" if returncode is not None else ""
+    return _sanitize_comment_body(
+        f"Provider {receipt.provider}{exit_detail}: {reason}.", max_chars=500
+    )
+
+
 class AgenticTaskResult(tuple):
     """Public result for ``run_agentic_task`` with legacy four-item unpacking.
 
@@ -1267,6 +1531,7 @@ class AgenticTaskResult(tuple):
         model_id: Optional[str] = None,
         cumulative_cost_usd: Optional[float] = None,
         provider_environment_failure: Optional[Tuple[str, str]] = None,
+        provider_attempt_receipt: Optional[ProviderAttemptReceipt] = None,
     ) -> "AgenticTaskResult":
         result = tuple.__new__(
             cls,
@@ -1279,6 +1544,7 @@ class AgenticTaskResult(tuple):
         result._model_id = model_id
         result._cumulative_cost_usd = cost_usd if cumulative_cost_usd is None else cumulative_cost_usd
         result._provider_environment_failure = provider_environment_failure
+        result._provider_attempt_receipt = provider_attempt_receipt
         return result
 
     def __iter__(self):
@@ -1333,6 +1599,11 @@ class AgenticTaskResult(tuple):
         """Trusted in-process provider/runtime classification, when present."""
         return getattr(self, "_provider_environment_failure", None)
 
+    @property
+    def provider_attempt_receipt(self) -> Optional[ProviderAttemptReceipt]:
+        """Trusted bounded disposition for a failed single provider attempt."""
+        return getattr(self, "_provider_attempt_receipt", None)
+
     def meets_usage_contract(self) -> bool:
         """True when this result has comparable cost/usage for E[pass]-λ·cost routing."""
         return _meets_usage_contract(self)
@@ -1353,6 +1624,11 @@ class AgenticTaskResult(tuple):
             "cumulative_cost_usd": self.cumulative_cost_usd,
             "usage_comparable": self.meets_usage_contract(),
             "token_buckets": _normalize_token_buckets(self.provider, self.usage),
+            "provider_attempt_receipt": (
+                self.provider_attempt_receipt.to_dict()
+                if self.provider_attempt_receipt is not None
+                else None
+            ),
         }
 
 
@@ -1369,6 +1645,7 @@ class _ProviderRunResult(tuple):
         requested_effort: Optional[str] = None,
         effective_effort: Optional[str] = None,
         provider_environment_reason: Optional[str] = None,
+        provider_attempt_receipt: Optional[ProviderAttemptReceipt] = None,
     ) -> "_ProviderRunResult":
         result = tuple.__new__(
             cls,
@@ -1383,6 +1660,7 @@ class _ProviderRunResult(tuple):
             ),
         )
         result._provider_environment_reason = provider_environment_reason
+        result._provider_attempt_receipt = provider_attempt_receipt
         return result
 
     def __iter__(self):
@@ -1403,6 +1681,10 @@ class _ProviderRunResult(tuple):
     @property
     def provider_environment_reason(self) -> Optional[str]:
         return getattr(self, "_provider_environment_reason", None)
+
+    @property
+    def provider_attempt_receipt(self) -> Optional[ProviderAttemptReceipt]:
+        return getattr(self, "_provider_attempt_receipt", None)
 
 
 @dataclass
@@ -5548,6 +5830,7 @@ def run_agentic_task(
         provider_environment_failure: Optional[Tuple[str, str]] = None
         harness_capabilities = _load_harness_capabilities()
         total_cost = 0.0
+        single_attempt_receipt: Optional[ProviderAttemptReceipt] = None
 
         for provider in candidates:
             if verbose:
@@ -5616,6 +5899,7 @@ def run_agentic_task(
                     stall_timeout=stall_timeout,
                     set_git_work_tree=set_git_work_tree,
                     background_safe=background_safe,
+                    attempt_number=attempt,
                 )
                 environment_reason = getattr(
                     provider_result, "provider_environment_reason", None
@@ -5632,6 +5916,13 @@ def run_agentic_task(
                 total_cost += cost
                 actual_model = provider_result[3]
                 usage = provider_result[4] if len(provider_result) > 4 else None
+                internal_receipt = getattr(
+                    provider_result, "provider_attempt_receipt", None
+                )
+                if single_provider_attempt and not success:
+                    single_attempt_receipt = internal_receipt or _new_provider_attempt_receipt(
+                        provider, attempt, "unknown", "ambiguous"
+                    )
                 last_output = output
                 # Keep requested/effective routing separate from provider-observed
                 # provenance. A successful result's model_id must never be filled
@@ -5708,6 +5999,20 @@ def run_agentic_task(
                     )
 
                     if is_false_positive:
+                        if single_provider_attempt:
+                            normalized_usage = _normalize_token_buckets(provider, usage)
+                            disposition: ProviderWorkDisposition = (
+                                "started_or_billable"
+                                if cost > 0
+                                or any(value > 0 for value in normalized_usage.values())
+                                else "ambiguous"
+                            )
+                            single_attempt_receipt = _new_provider_attempt_receipt(
+                                provider,
+                                attempt,
+                                "provider_error",
+                                disposition,
+                            )
                         if not quiet:
                             console.print(f"[yellow]Provider '{provider}' returned false positive (attempt {attempt}/{max_retries})[/yellow]")
                         # Issue #1376: log false-positive provider replies so the
@@ -5988,6 +6293,8 @@ def run_agentic_task(
             failure_output = _provider_environment_marker(*provider_environment_failure)
         else:
             failure_output = f"All agent providers failed: {'; '.join(provider_errors)}"
+        if single_provider_attempt:
+            failure_output = _sanitize_comment_body(failure_output, max_chars=500)
         failure_result = AgenticTaskResult(
             False,
             failure_output,
@@ -5996,6 +6303,9 @@ def run_agentic_task(
             None,
             cumulative_cost_usd=cumulative_cost_usd,
             provider_environment_failure=provider_environment_failure,
+            provider_attempt_receipt=(
+                single_attempt_receipt if single_provider_attempt else None
+            ),
         )
 
         _emit_routing_outcome(
@@ -8003,6 +8313,7 @@ def _run_with_provider(
     codex_skip_git_repo_check: bool = False,
     set_git_work_tree: bool = True,
     background_safe: bool = False,
+    attempt_number: int = 1,
 ) -> Union[Tuple[bool, str, float, Optional[str]], _ProviderRunResult]:
     """
     Internal helper to run a specific provider's CLI.
@@ -8358,9 +8669,27 @@ def _run_with_provider(
     try:
         result = runner(cmd, **runner_kwargs)
     except subprocess.TimeoutExpired:
-        return False, "Timeout expired", 0.0, None
-    except Exception as e:
-        return False, str(e), 0.0, None
+        receipt = _create_provider_attempt_receipt(
+            provider, attempt_number, 1, "", "", output_complete=False, timed_out=True
+        )
+        return _ProviderRunResult(
+            False,
+            _public_provider_failure_detail(receipt, None),
+            0.0,
+            None,
+            provider_attempt_receipt=receipt,
+        )
+    except Exception:
+        receipt = _new_provider_attempt_receipt(
+            provider, attempt_number, "transport", "ambiguous"
+        )
+        return _ProviderRunResult(
+            False,
+            _public_provider_failure_detail(receipt, None),
+            0.0,
+            None,
+            provider_attempt_receipt=receipt,
+        )
 
     result_is_spooled = isinstance(result, _SpooledCompletedProcess)
     try:
@@ -8378,17 +8707,32 @@ def _run_with_provider(
                 0.0,
                 None,
                 provider_environment_reason=provider_environment_reason,
+                provider_attempt_receipt=_new_provider_attempt_receipt(
+                    provider, attempt_number, "unknown", "ambiguous"
+                ),
             )
         if result.returncode != 0:
+            if result_is_spooled:
+                private_stdout = ""
+                private_stderr = ""
+                output_complete = False
+            else:
+                private_stdout = result.stdout or ""
+                private_stderr = result.stderr or ""
+                output_complete = True
+            receipt = _create_provider_attempt_receipt(
+                provider,
+                attempt_number,
+                result.returncode,
+                private_stdout,
+                private_stderr,
+                output_complete=output_complete,
+            )
             if provider == "openai":
                 if result_is_spooled:
-                    stdout_error = _extract_codex_jsonl_error_from_lines(
-                        _iter_spooled_lines(result.stdout_file)
-                    )
                     stderr_snippet = result.stderr_head + result.stderr_tail
                     stdout_snippet = result.stdout_head + result.stdout_tail
                 else:
-                    stdout_error = _extract_codex_jsonl_error(result.stdout or "")
                     stderr_snippet = result.stderr or ""
                     stdout_snippet = (result.stdout or "")[:MAX_ERROR_SNIPPET_LENGTH]
                 combined_error = "\n".join(
@@ -8396,16 +8740,26 @@ def _run_with_provider(
                 )
                 codex_auth_message = _codex_auth_failure_message(combined_error)
                 if codex_auth_message:
-                    return False, codex_auth_message, 0.0, None
-                if stdout_error:
-                    return False, f"Exit code {result.returncode}: {stdout_error}", 0.0, None
-                if stderr_snippet and not _is_codex_stdin_notice(stderr_snippet):
-                    error_detail = stderr_snippet
-                else:
-                    error_detail = (stdout_snippet or stderr_snippet)[:MAX_ERROR_SNIPPET_LENGTH]
-                return False, f"Exit code {result.returncode}: {error_detail}", 0.0, None
-            error_detail = result.stderr or result.stdout[:500]
-            return False, f"Exit code {result.returncode}: {error_detail}", 0.0, None
+                    receipt = _new_provider_attempt_receipt(
+                        provider,
+                        attempt_number,
+                        "credential_or_account",
+                        "ambiguous",
+                    )
+                return _ProviderRunResult(
+                    False,
+                    _public_provider_failure_detail(receipt, result.returncode),
+                    0.0,
+                    None,
+                    provider_attempt_receipt=receipt,
+                )
+            return _ProviderRunResult(
+                False,
+                _public_provider_failure_detail(receipt, result.returncode),
+                0.0,
+                None,
+                provider_attempt_receipt=receipt,
+            )
 
         # OpenCode: parse JSONL output via the dedicated parser. OpenCode emits a
         # different event schema than Codex/Claude (step_start, text, step_finish,
@@ -8430,7 +8784,27 @@ def _run_with_provider(
                 # provider failure inside OpenCode (e.g., "provider not
                 # configured"). Surface as failure, but keep cost and any
                 # captured model so callers can audit partial spend.
-                return False, str(err), cost, actual_model
+                receipt = _create_provider_attempt_receipt(
+                    provider,
+                    attempt_number,
+                    result.returncode,
+                    result.stdout or "",
+                    result.stderr or "",
+                )
+                if cost > 0:
+                    receipt = _new_provider_attempt_receipt(
+                        provider,
+                        attempt_number,
+                        "provider_error",
+                        "started_or_billable",
+                    )
+                return _ProviderRunResult(
+                    False,
+                    _public_provider_failure_detail(receipt, result.returncode),
+                    cost,
+                    actual_model,
+                    provider_attempt_receipt=receipt,
+                )
             return (
                 True,
                 str(parsed.get("text") or ""),
@@ -8478,7 +8852,20 @@ def _run_with_provider(
                 text.startswith("Error:")
                 or text.startswith("Authentication required.")
             ):
-                return False, text[:MAX_ERROR_SNIPPET_LENGTH], 0.0, None
+                receipt = _create_provider_attempt_receipt(
+                    provider,
+                    attempt_number,
+                    result.returncode,
+                    result.stdout or "",
+                    result.stderr or "",
+                )
+                return _ProviderRunResult(
+                    False,
+                    _public_provider_failure_detail(receipt, result.returncode),
+                    0.0,
+                    None,
+                    provider_attempt_receipt=receipt,
+                )
             return True, text, 0.0, None
 
         # Parse JSON Output
@@ -8522,15 +8909,31 @@ def _run_with_provider(
                     f"JSON keys: {sorted(data.keys())}[/dim]"
                 )
             if provider == "anthropic":
+                receipt = (
+                    _create_provider_attempt_receipt(
+                        provider,
+                        attempt_number,
+                        result.returncode,
+                        output_str,
+                        result.stderr or "",
+                    )
+                    if not success
+                    else None
+                )
                 return _ProviderRunResult(
                     success,
-                    text,
+                    (
+                        _public_provider_failure_detail(receipt, result.returncode)
+                        if receipt is not None
+                        else text
+                    ),
                     cost,
                     actual_model,
                     _extract_anthropic_standard_usage(
                         data,
                         actual_model=actual_model,
                     ),
+                    provider_attempt_receipt=receipt,
                 )
             if provider == "openai":
                 raw_usage = data.get("usage") if isinstance(data, dict) else None
@@ -8550,18 +8953,25 @@ def _run_with_provider(
                 )
             return success, text, cost, actual_model
         except json.JSONDecodeError:
-            # Fallback if CLI didn't output valid JSON (sometimes happens on
-            # crash). Use HEAD+TAIL for spooled results: _read_spool_snippets
-            # returns tail="" for files <=64KiB, so short invalid output would
-            # otherwise yield an empty diagnostic.
-            snippet = (
-                _bounded_head_tail(
-                    result.stdout_head, result.stdout_tail, MAX_ERROR_SNIPPET_LENGTH
-                )
-                if result_is_spooled
-                else result.stdout[:MAX_ERROR_SNIPPET_LENGTH]
+            # Invalid or incomplete provider output never becomes a public raw
+            # snippet; retain only its fail-closed receipt classification.
+            receipt = _create_provider_attempt_receipt(
+                provider,
+                attempt_number,
+                getattr(result, "returncode", 1),
+                "" if result_is_spooled else (result.stdout or ""),
+                "" if result_is_spooled else (result.stderr or ""),
+                output_complete=not result_is_spooled,
             )
-            return False, f"Invalid JSON output: {snippet}...", 0.0, None
+            return _ProviderRunResult(
+                False,
+                _public_provider_failure_detail(
+                    receipt, getattr(result, "returncode", None)
+                ),
+                0.0,
+                None,
+                provider_attempt_receipt=receipt,
+            )
     finally:
         if result_is_spooled:
             result.close()

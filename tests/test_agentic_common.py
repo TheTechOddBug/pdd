@@ -2876,6 +2876,7 @@ def test_agentic_task_result_exposes_usage_while_preserving_four_unpack():
             "cache_write_tokens": 11,
             "reasoning_tokens": 0,
         },
+        "provider_attempt_receipt": None,
     }
 
 
