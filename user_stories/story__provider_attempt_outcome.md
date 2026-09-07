@@ -1,4 +1,4 @@
-<!-- pdd-story-prompts: prompts/agentic_common_python.prompt -->
+<!-- pdd-story-prompts: pdd/prompts/agentic_common_python.prompt -->
 
 # User Story: Trustworthy provider attempt outcomes
 
