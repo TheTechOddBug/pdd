@@ -1505,7 +1505,7 @@ def _promote_receipt_for_activity(
         return _new_provider_attempt_receipt(
             receipt.provider,
             receipt.attempt_number,
-            "provider_error",
+            receipt.failure_kind,
             "started_or_billable",
         )
     return receipt
@@ -9036,7 +9036,7 @@ def _run_with_provider(
                         provider,
                         attempt_number,
                         "credential_or_account",
-                        "ambiguous",
+                        receipt.work_disposition,
                     )
                     public_codex_error = _sanitize_comment_body(
                         codex_auth_message,

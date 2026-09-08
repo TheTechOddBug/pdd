@@ -525,6 +525,45 @@ def test_codex_spooled_positive_usage_yields_started_or_billable(tmp_path):
     assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
 
 
+def test_codex_positive_usage_wins_over_simultaneous_auth_text(tmp_path):
+    payload = (
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "type": "error",
+                "message": "401 unauthorized: access token could not be refreshed",
+            }
+        )
+        + "\n"
+    ).encode()
+    boundary = ac._SpooledCompletedProcess(
+        args=["codex"],
+        returncode=1,
+        stdout_file=io.BytesIO(payload),
+        stderr_file=io.BytesIO(b""),
+        stdout_bytes=len(payload),
+        stderr_bytes=0,
+        stdout_head=payload.decode(),
+        stdout_tail="",
+        stderr_head="",
+        stderr_tail="",
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=boundary,
+    )
+    receipt = result.provider_attempt_receipt
+    assert receipt.failure_kind == "credential_or_account"
+    assert receipt.work_disposition == "started_or_billable"
+
+
 def test_codex_unknown_positive_usage_field_does_not_claim_started():
     receipt = ac._create_provider_attempt_receipt(
         "openai",
