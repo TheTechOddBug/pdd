@@ -11,6 +11,12 @@ import pytest
 import pdd.agentic_common as ac
 
 
+pytestmark = [
+    pytest.mark.timeout(60),
+    pytest.mark.story(story_id="provider_attempt_outcome"),
+]
+
+
 @pytest.fixture(autouse=True)
 def _reset_provider_state():
     ac.reset_disabled_providers()

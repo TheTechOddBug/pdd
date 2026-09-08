@@ -20,7 +20,10 @@ import pytest
 import pdd.agentic_common as ac
 
 
-pytestmark = pytest.mark.timeout(60)
+pytestmark = [
+    pytest.mark.timeout(60),
+    pytest.mark.story(story_id="provider_attempt_outcome"),
+]
 
 
 def _zero_work_rejection() -> dict[str, Any]:
