@@ -171,6 +171,34 @@ def test_cloud_batch_image_installs_and_verifies_github_cli():
     assert "gh --version" in cloudbuild_text or '["gh", "--version"]' in cloudbuild_text
 
 
+def test_cloud_batch_image_installs_every_collection_time_dependency():
+    dockerfile_text = (
+        REPO_ROOT / "ci" / "cloud-batch" / "Dockerfile"
+    ).read_text(encoding="utf-8")
+    cloudbuild_text = (
+        REPO_ROOT / "ci" / "cloud-batch" / "cloudbuild.yaml"
+    ).read_text(encoding="utf-8")
+    entrypoint_text = (
+        REPO_ROOT / "ci" / "cloud-batch" / "entrypoint.sh"
+    ).read_text(encoding="utf-8")
+
+    # test_zsh_completion imports pexpect at module collection time. The
+    # immutable worker must carry and verify it before any Batch job is
+    # published or submitted.
+    assert "'pexpect>=4.9'" in dockerfile_text
+    assert "import pexpect" in cloudbuild_text
+    assert "testmon, pexpect" in entrypoint_text
+
+
+def test_cloud_batch_preflight_preserves_collection_diagnostics():
+    entrypoint_text = (
+        REPO_ROOT / "ci" / "cloud-batch" / "entrypoint.sh"
+    ).read_text(encoding="utf-8")
+
+    assert '>"${RESULT_LOG}" 2>&1 || PREFLIGHT_EXIT=$?' in entrypoint_text
+    assert 'tail -50 "${RESULT_LOG}" || true' in entrypoint_text
+
+
 def test_cloud_batch_image_provisions_protected_linux_sandbox():
     dockerfile_text = (
         REPO_ROOT / "ci" / "cloud-batch" / "Dockerfile"

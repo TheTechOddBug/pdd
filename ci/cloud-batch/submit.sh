@@ -96,15 +96,19 @@ esac
 IMAGE_URI="${AR_IMAGE}@${IMAGE_DIGEST}"
 
 _resolve_secret_resource() {
-    local secret_name="$1" described version
-    described=$(gcloud secrets versions describe latest \
+    local secret_name="$1" described state version
+    read -r described state <<<"$(gcloud secrets versions describe latest \
         --secret="${secret_name}" \
         --project="${PROJECT_ID}" \
-        --format='value(name)')
+        --format='value(name,state)')"
     version="${described##*/}"
     case "${version}" in
         ''|0|*[!0-9]*) echo "Pinned credential version unavailable" >&2; return 1 ;;
     esac
+    if [ "${state}" != "ENABLED" ]; then
+        echo "Pinned credential version is not enabled: ${secret_name} version ${version}" >&2
+        return 1
+    fi
     printf 'projects/%s/secrets/%s/versions/%s\n' \
         "${PROJECT_ID}" "${secret_name}" "${version}"
 }
@@ -435,8 +439,10 @@ while [ "${ELAPSED}" -lt "${POLL_TIMEOUT}" ]; do
     if _is_terminal "${STATUS_PYTEST}" && _is_terminal "${STATUS_MAIN}" && _is_terminal "${STATUS_STD}" && _is_terminal "${STATUS_CLOUD}"; then
         _with_timeout 30 gcloud storage cp --quiet \
             "gs://${BUCKET}/${JOB_RUN_ID}/results/task_*.json" "${STREAMING_DIR}/"
-        _with_timeout 30 gcloud storage cp --quiet \
-            "gs://${BUCKET}/${JOB_RUN_ID}/results/task_*.log" "${STREAMING_DIR}/"
+        if ! _with_timeout 30 gcloud storage cp --quiet \
+            "gs://${BUCKET}/${JOB_RUN_ID}/results/task_*.log" "${STREAMING_DIR}/"; then
+            echo "No task log artifacts were uploaded; continuing with attributable Cloud Logging." >&2
+        fi
         echo "=== Verifying attributable logs contain no credential fingerprints ==="
         if ! _verify_secret_log_boundary; then
             echo "=== Credential-log boundary verification FAILED ==="

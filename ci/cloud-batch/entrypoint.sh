@@ -256,13 +256,13 @@ if [ "${TASK_INDEX}" -ge "${PYTEST_START}" ] &&
     preflight_protected_sandbox
 fi
 
-# Image plugin contract: confirm pytest plugins required by markers in tests/
-# are actually importable. Catches a stale image, or someone bumping
-# requirements.txt without updating Dockerfile's explicit plugin install.
+# Image collection contract: confirm plugins and direct collection-time test
+# dependencies are importable. Catches a stale image, or someone adding a
+# collection import without updating Dockerfile's explicit dependency install.
 "${PYTEST_USER_COMMAND[@]}" python -c \
-    "import pytest_timeout, xdist, pytest_mock, pytest_asyncio, pytest_cov, testmon" || {
-    echo "FATAL: image missing expected pytest plugins"
-    write_result "failed" "${SETUP_SECONDS}" "preflight" "missing pytest plugins"
+    "import pytest_timeout, xdist, pytest_mock, pytest_asyncio, pytest_cov, testmon, pexpect" || {
+    echo "FATAL: image missing expected pytest collection dependencies"
+    write_result "failed" "${SETUP_SECONDS}" "preflight" "missing collection dependencies"
     exit 1
 }
 
@@ -274,9 +274,10 @@ fi
 PREFLIGHT_EXIT=0
 "${PYTEST_USER_COMMAND[@]}" python -m pytest --collect-only --quiet \
     --strict-markers --strict-config tests/ -k __nonexistent__ \
-    >/dev/null 2>&1 || PREFLIGHT_EXIT=$?
+    >"${RESULT_LOG}" 2>&1 || PREFLIGHT_EXIT=$?
 if [ "$PREFLIGHT_EXIT" -ne 0 ] && [ "$PREFLIGHT_EXIT" -ne 5 ]; then
     echo "FATAL: pytest config or marker registration is broken (exit=$PREFLIGHT_EXIT)"
+    tail -50 "${RESULT_LOG}" || true
     write_result "failed" "${SETUP_SECONDS}" "preflight" "pytest config invalid"
     exit 1
 fi

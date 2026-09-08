@@ -1069,5 +1069,21 @@ def test_submit_scans_complete_artifacts_before_reporting() -> None:
     submit = (CLOUD_BATCH / "submit.sh").read_text(encoding="utf-8")
 
     assert 'results/task_*.log" "${STREAMING_DIR}/"' in submit
+    assert "No task log artifacts were uploaded" in submit
     assert 'verifier_args+=(--log-file "${artifact_log}")' in submit
     assert "gcloud storage cat" not in submit
+
+
+def test_submit_rejects_disabled_latest_secret_before_upload_or_submission() -> None:
+    submit = (CLOUD_BATCH / "submit.sh").read_text(encoding="utf-8")
+
+    state_lookup = "--format='value(name,state)'"
+    enabled_check = 'if [ "${state}" != "ENABLED" ]; then'
+    source_upload = 'echo "=== Uploading source tarball ==="'
+    first_submission = 'gcloud batch jobs submit "${JOB_NAME_PYTEST}"'
+
+    assert state_lookup in submit
+    assert enabled_check in submit
+    assert "Pinned credential version is not enabled" in submit
+    assert submit.index(enabled_check) < submit.index(source_upload)
+    assert submit.index(enabled_check) < submit.index(first_submission)
