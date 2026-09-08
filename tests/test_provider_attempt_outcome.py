@@ -157,8 +157,12 @@ def _codex_current_item_pair(item_type: str) -> tuple[dict[str, Any], dict[str, 
             "type": item_type,
             "command": "true",
             "aggregated_output": "",
+            "exit_code": None,
         }
-        return ({**base, "status": "in_progress"}, {**base, "status": "completed", "exit_code": 0})
+        return (
+            {**base, "status": "in_progress"},
+            {**base, "status": "completed", "exit_code": 0},
+        )
     if item_type == "file_change":
         base = {
             "id": "item_file",
@@ -175,9 +179,38 @@ def _codex_current_item_pair(item_type: str) -> tuple[dict[str, Any], dict[str, 
             "tool": "synthetic-tool",
             "arguments": {},
         }
-        return ({**base, "status": "in_progress"}, {**base, "status": "completed", "result": {}})
+        return (
+            {**base, "status": "in_progress", "result": None, "error": None},
+            {
+                **base,
+                "status": "completed",
+                "result": {"content": [], "structured_content": None},
+                "error": None,
+            },
+        )
+    if item_type == "collab_tool_call":
+        base = {
+            "id": "item_collab",
+            "type": item_type,
+            "tool": "spawn_agent",
+            "sender_thread_id": "thread_parent",
+            "receiver_thread_ids": ["thread_child"],
+            "prompt": "synthetic task",
+            "agents_states": {
+                "thread_child": {"status": "running", "message": None}
+            },
+        }
+        return (
+            {**base, "status": "in_progress"},
+            {**base, "status": "completed"},
+        )
     if item_type == "web_search":
-        item = {"id": "item_search", "type": item_type, "query": "synthetic"}
+        item = {
+            "id": "item_search",
+            "type": item_type,
+            "query": "synthetic",
+            "action": {"type": "search", "query": "synthetic"},
+        }
         return (item, item)
     raise AssertionError(f"unsupported synthetic item type: {item_type}")
 
@@ -1224,7 +1257,13 @@ def test_codex_started_agent_message_proves_acceptance(tmp_path, returncode):
 @pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
 @pytest.mark.parametrize(
     "item_type",
-    ["command_execution", "file_change", "mcp_tool_call", "web_search"],
+    [
+        "command_execution",
+        "file_change",
+        "mcp_tool_call",
+        "collab_tool_call",
+        "web_search",
+    ],
 )
 def test_codex_current_tool_items_claim_started(tmp_path, item_type, returncode):
     started_item, completed_item = _codex_current_item_pair(item_type)
@@ -1281,6 +1320,187 @@ def test_codex_current_tool_stream_preserves_exit_zero_success(tmp_path):
     )
     assert result.success is True
     assert result.provider_attempt_receipt is None
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_codex_item_updated_todo_claims_started(tmp_path, returncode):
+    stdout = json.dumps(
+        {
+            "type": "item.updated",
+            "item": {
+                "id": "item_todo",
+                "type": "todo_list",
+                "items": [{"text": "synthetic step", "completed": False}],
+            },
+        }
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "item",
+    [
+        {
+            **_codex_current_item_pair("command_execution")[0],
+            "status": "declined",
+        },
+        {
+            **_codex_current_item_pair("file_change")[0],
+            "status": "in_progress",
+        },
+        {
+            **_codex_current_item_pair("mcp_tool_call")[0],
+            "status": "failed",
+            "result": None,
+            "error": {"message": "synthetic tool failure"},
+        },
+    ],
+    ids=["declined-command", "in-progress-file", "failed-mcp"],
+)
+def test_codex_provider_real_status_variants_claim_started(
+    tmp_path, returncode, item
+):
+    stdout = json.dumps({"type": "item.completed", "item": item})
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "action",
+    [
+        {"type": "search", "queries": ["synthetic"]},
+        {"type": "open_page", "url": "https://example.invalid"},
+        {
+            "type": "find_in_page",
+            "url": "https://example.invalid",
+            "pattern": "synthetic",
+        },
+        {"type": "other"},
+    ],
+    ids=["search", "open-page", "find-in-page", "other"],
+)
+def test_codex_web_search_action_variants_claim_started(
+    tmp_path, returncode, action
+):
+    item = {
+        **_codex_current_item_pair("web_search")[0],
+        "action": action,
+    }
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(
+            json.dumps({"type": "item.completed", "item": item}),
+            returncode=returncode,
+        ),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_codex_provider_real_web_search_double_id_claims_started(
+    tmp_path, returncode
+):
+    # Codex 0.153.2 flattens outer ThreadItem.id and inner WebSearchItem.id.
+    stdout = (
+        '{"type":"item.completed","item":{"id":"item_outer",'
+        '"type":"web_search","id":"item_inner","query":"synthetic",'
+        '"action":{"type":"other"}}}'
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        '{"type":"item.completed","item":{"id":"one",'
+        '"type":"agent_message","id":"two","text":"synthetic"}}',
+        '{"type":"item.completed","item":{"id":"one",'
+        '"type":"web_search","id":7,"query":"synthetic",'
+        '"action":{"type":"other"}}}',
+    ],
+    ids=["duplicate-id-wrong-variant", "duplicate-id-wrong-type"],
+)
+def test_codex_unreviewed_duplicate_ids_remain_ambiguous(tmp_path, stdout):
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=1),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "item",
+    [
+        {
+            key: value
+            for key, value in _codex_current_item_pair("command_execution")[1].items()
+            if key != "exit_code"
+        },
+        {
+            **_codex_current_item_pair("command_execution")[0],
+            "exit_code": 0,
+        },
+        {
+            **_codex_current_item_pair("mcp_tool_call")[0],
+            "status": "completed",
+        },
+        {
+            "id": "item_search",
+            "type": "web_search",
+            "query": "synthetic",
+        },
+        {
+            "id": "item_message",
+            "type": "agent_message",
+            "text": "synthetic",
+            "tool_calls": [{"tool": "forged"}],
+        },
+    ],
+    ids=[
+        "completed-command-no-exit",
+        "started-command-with-exit",
+        "completed-mcp-no-result",
+        "web-search-no-action",
+        "agent-message-cross-field",
+    ],
+)
+def test_codex_malformed_current_items_remain_ambiguous(
+    tmp_path, returncode, item
+):
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(
+            json.dumps({"type": "item.completed", "item": item}),
+            returncode=returncode,
+        ),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
 @pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
@@ -1364,6 +1584,44 @@ def test_codex_classification_is_newline_invariant(event):
     )
     assert without_newline.work_disposition == "started_or_billable"
     assert with_newline.work_disposition == without_newline.work_disposition
+
+
+@pytest.mark.parametrize("terminator", ["", "\n"], ids=["no-newline", "newline"])
+def test_codex_public_nonspooled_single_event_is_schema_validated(
+    tmp_path, terminator
+):
+    valid = {
+        "type": "item.completed",
+        "item": {
+            "id": "item_message",
+            "type": "agent_message",
+            "text": "A complete synthetic Codex answer. " * 4,
+        },
+    }
+    successful, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_completed(json.dumps(valid) + terminator, returncode=0),
+    )
+    assert successful.success is True
+    assert successful.provider_attempt_receipt is None
+
+    malformed = {
+        "type": "item.completed",
+        "usage": {"input_tokens": 1},
+        "item": {
+            "id": "item_message",
+            "type": "agent_message",
+            "text": {"forged": ["not provider-valid text"]},
+        },
+    }
+    rejected, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_completed(json.dumps(malformed) + terminator, returncode=0),
+    )
+    assert rejected.success is False
+    assert rejected.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
 def test_codex_unknown_positive_usage_field_does_not_claim_started():

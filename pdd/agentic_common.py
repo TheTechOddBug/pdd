@@ -1438,6 +1438,46 @@ def _strict_json_object(text: str) -> Any:
     return decoded
 
 
+def _strict_codex_json_object(text: str) -> Any:
+    """Decode Codex JSONL, including its reviewed web-search double ID.
+
+    Codex 0.153.2 flattens ``ThreadItem.id`` and ``WebSearchItem.id`` into the
+    same object, so that one provider-owned variant serializes two string
+    ``id`` keys. Every other duplicate remains malformed.
+    """
+
+    def _reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    def _review_web_search_id_collision(
+        pairs: List[Tuple[str, Any]],
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        duplicate_ids: List[Any] = []
+        for key, value in pairs:
+            if key in result:
+                if key != "id":
+                    raise ValueError(f"duplicate JSON object key: {key}")
+                duplicate_ids.extend([result[key], value])
+            result[key] = value
+        if duplicate_ids and (
+            len(duplicate_ids) != 2
+            or result.get("type") != "web_search"
+            or not all(isinstance(value, str) and value for value in duplicate_ids)
+        ):
+            raise ValueError("unreviewed duplicate Codex id")
+        return result
+
+    decoded = json.loads(
+        text,
+        parse_constant=_reject_constant,
+        object_pairs_hook=_review_web_search_id_collision,
+    )
+    if _contains_nonfinite_number(decoded):
+        raise ValueError("non-finite JSON number")
+    return decoded
+
+
 def _mapping_has_only_reviewed_fields(
     data: Mapping[str, Any], path: Tuple[str, ...] = (),
 ) -> bool:
@@ -1724,9 +1764,47 @@ def _codex_required_strings(item: Mapping[str, Any], names: Set[str]) -> bool:
     return all(isinstance(item.get(name), str) and item.get(name) for name in names)
 
 
-def _codex_status_is_reviewed(status: Any, *, started: bool) -> bool:
-    allowed = {"in_progress"} if started else {"completed", "failed"}
-    return isinstance(status, str) and status in allowed
+def _codex_web_search_action_is_reviewed(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    action_type = value.get("type")
+    allowed_fields = {
+        "search": {"type", "query", "queries"},
+        "open_page": {"type", "url"},
+        "find_in_page": {"type", "url", "pattern"},
+        "other": {"type"},
+    }.get(action_type)
+    if allowed_fields is None or not set(value).issubset(allowed_fields):
+        return False
+    return all(
+        isinstance(value[name], str)
+        for name in ("query", "url", "pattern")
+        if name in value
+    ) and (
+        "queries" not in value
+        or (
+            isinstance(value["queries"], list)
+            and all(isinstance(query, str) for query in value["queries"])
+        )
+    )
+
+
+def _codex_collab_agents_shape_is_reviewed(value: Any) -> bool:
+    statuses = {
+        "pending_init", "running", "interrupted", "completed", "errored",
+        "shutdown", "not_found",
+    }
+    if not isinstance(value, Mapping):
+        return False
+    return all(
+        isinstance(agent_id, str)
+        and agent_id
+        and isinstance(state, Mapping)
+        and set(state) == {"status", "message"}
+        and state.get("status") in statuses
+        and (state.get("message") is None or isinstance(state.get("message"), str))
+        for agent_id, state in value.items()
+    )
 
 
 def _codex_current_item_activity(
@@ -1748,8 +1826,13 @@ def _codex_current_item_activity(
         "result",
         "error",
         "query",
+        "action",
         "message",
         "items",
+        "sender_thread_id",
+        "receiver_thread_ids",
+        "prompt",
+        "agents_states",
     }
     allowed_by_type = {
         "agent_message": {"text"},
@@ -1759,7 +1842,11 @@ def _codex_current_item_activity(
         },
         "file_change": {"changes", "status"},
         "mcp_tool_call": {"server", "tool", "arguments", "result", "error", "status"},
-        "web_search": {"query"},
+        "collab_tool_call": {
+            "tool", "sender_thread_id", "receiver_thread_ids", "prompt",
+            "agents_states", "status",
+        },
+        "web_search": {"query", "action"},
         "todo_list": {"items"},
         "error": {"message"},
     }
@@ -1777,10 +1864,15 @@ def _codex_current_item_activity(
             return None
         if not isinstance(item.get("aggregated_output"), str):
             return None
-        if not _codex_status_is_reviewed(item.get("status"), started=started):
+        status = item.get("status")
+        if status not in {"in_progress", "completed", "failed", "declined"}:
             return None
         exit_code = item.get("exit_code")
-        if exit_code is not None and (
+        if "exit_code" not in item:
+            return None
+        if status in {"in_progress", "declined"} and exit_code is not None:
+            return None
+        if status in {"completed", "failed"} and (
             isinstance(exit_code, bool) or not isinstance(exit_code, int)
         ):
             return None
@@ -1796,18 +1888,27 @@ def _codex_current_item_activity(
                 and change.get("kind") in {"add", "delete", "update"}
                 for change in changes
             )
-            or item.get("status") not in {"completed", "failed"}
+            or item.get("status") not in {"in_progress", "completed", "failed"}
         ):
             return None
         return True
     if item_type == "mcp_tool_call":
         if not _codex_required_strings(item, {"id", "server", "tool"}):
             return None
-        if "arguments" not in item or not _codex_status_is_reviewed(
-            item.get("status"), started=started
-        ):
+        status = item.get("status")
+        if "arguments" not in item or status not in {
+            "in_progress", "completed", "failed"
+        }:
             return None
-        if "result" in item and not isinstance(item.get("result"), Mapping):
+        if "result" not in item or "error" not in item:
+            return None
+        result = item.get("result")
+        if result is not None and (
+            not isinstance(result, Mapping)
+            or not isinstance(result.get("content"), list)
+            or "structured_content" not in result
+            or not set(result).issubset({"content", "_meta", "structured_content"})
+        ):
             return None
         error = item.get("error")
         if error is not None and (
@@ -1815,11 +1916,35 @@ def _codex_current_item_activity(
             or not isinstance(error.get("message"), str)
         ):
             return None
-        if "result" in item and "error" in item:
+        if status == "in_progress" and (result is not None or error is not None):
+            return None
+        if status == "completed" and (result is None or error is not None):
+            return None
+        if status == "failed" and (result is not None or error is None):
+            return None
+        return True
+    if item_type == "collab_tool_call":
+        receiver_ids = item.get("receiver_thread_ids")
+        if (
+            not _codex_required_strings(item, {"id", "sender_thread_id"})
+            or item.get("tool") not in {
+                "spawn_agent", "send_input", "wait", "close_agent"
+            }
+            or not isinstance(receiver_ids, list)
+            or not all(isinstance(thread_id, str) for thread_id in receiver_ids)
+            or (item.get("prompt") is not None and not isinstance(item.get("prompt"), str))
+            or not _codex_collab_agents_shape_is_reviewed(item.get("agents_states"))
+            or item.get("status") not in {"in_progress", "completed", "failed"}
+        ):
             return None
         return True
     if item_type == "web_search":
-        return True if _codex_required_strings(item, {"id", "query"}) else None
+        return (
+            True
+            if _codex_required_strings(item, {"id", "query"})
+            and _codex_web_search_action_is_reviewed(item.get("action"))
+            else None
+        )
     if item_type == "todo_list":
         todos = item.get("items")
         if (
@@ -1871,13 +1996,20 @@ def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
         "command_execution",
         "file_change",
         "mcp_tool_call",
+        "collab_tool_call",
         "web_search",
         "todo_list",
         "error",
     } or (item_type == "agent_message" and "id" in item):
         return _codex_current_item_activity(item, started=started)
+    legacy_classifier_fields = {
+        "tool", "tool_calls", "command", "aggregated_output", "exit_code",
+        "status", "changes", "server", "arguments", "result", "error",
+        "query", "action", "items", "sender_thread_id", "receiver_thread_ids",
+        "prompt", "agents_states",
+    }
     if item_type == "agent_message":
-        if "tool" in item or "tool_calls" in item:
+        if any(name in item for name in legacy_classifier_fields):
             return None
         if "text" not in item:
             return True if started else None
@@ -1886,12 +2018,16 @@ def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
             return None
         return True if started else bool(text)
     if item_type == "tool_call":
-        if "text" in item or "tool_calls" in item:
+        if "text" in item or any(
+            name in item for name in legacy_classifier_fields - {"tool"}
+        ):
             return None
         tool = item.get("tool")
         return True if isinstance(tool, str) and tool else None
     if item_type == "tool_output":
-        if "text" in item or "tool" in item:
+        if "text" in item or any(
+            name in item for name in legacy_classifier_fields - {"tool_calls"}
+        ):
             return None
         return True if _codex_tool_calls_shape_is_reviewed(
             item.get("tool_calls")
@@ -1906,6 +2042,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
         "init",
         "item.completed",
         "item.started",
+        "item.updated",
         "message",
         "result",
         "session.end",
@@ -1922,7 +2059,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
         if not line.strip():
             continue
         try:
-            event = _strict_json_object(line)
+            event = _strict_codex_json_object(line)
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
         if not isinstance(event, Mapping) or event.get("type") not in known_types:
@@ -1951,7 +2088,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             if content:
                 observed_activity = True
             continue
-        if event_type == "item.completed":
+        if event_type in {"item.completed", "item.updated"}:
             item_activity = _codex_item_activity(event.get("item"))
             if item_activity is None:
                 return None
@@ -9812,7 +9949,7 @@ def _run_with_provider(
                 data = _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
                 if not data:
                     raise json.JSONDecodeError("No JSON", result.stdout_tail[:200], 0)
-            elif provider == "openai" and "\n" in output_str:
+            elif provider == "openai":
                 codex_observed_activity = _codex_jsonl_has_observed_activity(
                     iter(output_str.splitlines())
                 )
