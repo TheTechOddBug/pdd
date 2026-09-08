@@ -690,6 +690,37 @@ def test_opencode_unreviewed_activity_shape_is_ambiguous(event):
     assert receipt.work_disposition == "ambiguous"
 
 
+@pytest.mark.parametrize(
+    "malformed_event",
+    [
+        {"type": "text", "part": {"type": "text", "text": {"forged": "shape"}}},
+        {"type": "step_finish", "part": {"cost": "0.01"}},
+        {"type": "error", "message": {"forged": "shape"}},
+        {"type": "session.end", "model": {"forged": "shape"}},
+    ],
+    ids=["text", "step-finish", "error", "session-end"],
+)
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_opencode_malformed_known_event_overrides_activity(
+    tmp_path, malformed_event, returncode
+):
+    stdout = "\n".join(
+        [
+            json.dumps(_opencode_step_start()),
+            json.dumps(malformed_event),
+            json.dumps({"type": "error", "message": "synthetic failure"}),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout, returncode=returncode),
+        )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
 def test_opencode_supported_session_end_remains_successful(tmp_path):
     stdout = "\n".join(
         [
