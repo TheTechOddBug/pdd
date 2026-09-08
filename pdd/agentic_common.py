@@ -169,7 +169,11 @@ def _normalize_token_buckets(provider: str, raw_usage: Any) -> Dict[str, int]:
             if not isinstance(row, dict):
                 continue
             for key, value in row.items():
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                ):
                     continue
                 summed[key] = summed.get(key, 0) + int(value)
         raw_usage = summed
@@ -180,9 +184,11 @@ def _normalize_token_buckets(provider: str, raw_usage: Any) -> Dict[str, int]:
             if not isinstance(cur, dict):
                 return 0
             cur = cur.get(key)
+        if isinstance(cur, float) and not math.isfinite(cur):
+            return 0
         try:
             return int(cur or 0)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return 0
 
     provider = provider.lower()
@@ -1387,6 +1393,17 @@ def _is_positive_number(value: Any) -> bool:
     )
 
 
+def _contains_nonfinite_number(value: Any) -> bool:
+    """Return whether nested provider evidence contains NaN or infinity."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Mapping):
+        return any(_contains_nonfinite_number(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonfinite_number(item) for item in value)
+    return False
+
+
 def _nested_value(data: Mapping[str, Any], path: Tuple[str, ...]) -> Any:
     current: Any = data
     for key in path:
@@ -1410,11 +1427,14 @@ def _strict_json_object(text: str) -> Any:
             result[key] = value
         return result
 
-    return json.loads(
+    decoded = json.loads(
         text,
         parse_constant=_reject_constant,
         object_pairs_hook=_reject_duplicate_keys,
     )
+    if _contains_nonfinite_number(decoded):
+        raise ValueError("non-finite JSON number")
+    return decoded
 
 
 def _mapping_has_only_reviewed_fields(
@@ -2038,6 +2058,7 @@ class _ProviderRunResult(tuple):
         provider_environment_reason: Optional[str] = None,
         provider_attempt_receipt: Optional[ProviderAttemptReceipt] = None,
         classification_detail: Optional[str] = None,
+        evidence_trustworthy: bool = True,
     ) -> "_ProviderRunResult":
         result = tuple.__new__(
             cls,
@@ -2054,6 +2075,7 @@ class _ProviderRunResult(tuple):
         result._provider_environment_reason = provider_environment_reason
         result._provider_attempt_receipt = provider_attempt_receipt
         result._classification_detail = classification_detail
+        result._evidence_trustworthy = bool(evidence_trustworthy)
         return result
 
     def __iter__(self):
@@ -2083,6 +2105,11 @@ class _ProviderRunResult(tuple):
     def classification_detail(self) -> Optional[str]:
         """Private provider signal retained when the public detail is bounded."""
         return getattr(self, "_classification_detail", None)
+
+    @property
+    def evidence_trustworthy(self) -> bool:
+        """Whether complete structured output passed the strict trust parser."""
+        return bool(getattr(self, "_evidence_trustworthy", True))
 
 
 @dataclass
@@ -6327,8 +6354,6 @@ def run_agentic_task(
                 success = bool(provider_result[0])
                 output = str(provider_result[1])
                 cost = float(provider_result[2])
-                cumulative_cost_usd += cost
-                total_cost += cost
                 actual_model = provider_result[3]
                 usage = provider_result[4] if len(provider_result) > 4 else None
                 internal_receipt = getattr(
@@ -6337,6 +6362,20 @@ def run_agentic_task(
                 classification_detail = getattr(
                     provider_result, "classification_detail", None
                 ) or output
+                evidence_trustworthy = bool(
+                    getattr(provider_result, "evidence_trustworthy", True)
+                )
+                if not math.isfinite(cost) or _contains_nonfinite_number(usage):
+                    evidence_trustworthy = False
+                    cost = 0.0
+                    usage = None
+                if single_provider_attempt and success and not evidence_trustworthy:
+                    success = False
+                    internal_receipt = _new_provider_attempt_receipt(
+                        provider, attempt, "unknown", "ambiguous"
+                    )
+                cumulative_cost_usd += cost
+                total_cost += cost
                 if single_provider_attempt and not success:
                     single_attempt_receipt = _promote_receipt_for_activity(
                         internal_receipt or _new_provider_attempt_receipt(
@@ -9229,6 +9268,9 @@ def _run_with_provider(
         # error...) and routes cost via ``step_finish.part.cost``, so it doesn't
         # belong in the shared single-JSON / Codex-NDJSON path below.
         if provider == "opencode":
+            opencode_evidence_trustworthy = (
+                _opencode_jsonl_has_observed_activity(result.stdout) is not None
+            )
             parsed = _parse_opencode_jsonl(result.stdout)
             actual_model = parsed.get("model") or None
             err = parsed.get("error") or ""
@@ -9269,12 +9311,15 @@ def _run_with_provider(
                     actual_model,
                     provider_attempt_receipt=receipt,
                     classification_detail=str(err),
+                    evidence_trustworthy=opencode_evidence_trustworthy,
                 )
-            return (
+            return _ProviderRunResult(
                 True,
                 str(parsed.get("text") or ""),
                 cost,
                 actual_model,
+                parsed.get("tokens"),
+                evidence_trustworthy=opencode_evidence_trustworthy,
             )
 
         # Diagnostic: capture when CLI exits 0 with empty / whitespace-only stdout.
@@ -9343,14 +9388,29 @@ def _run_with_provider(
             # the in-RAM string.
             output_str = "" if result_is_spooled else result.stdout.strip()
             data: Dict[str, Any] = {}
+            structured_evidence_trustworthy = True
 
             if provider == "openai" and result_is_spooled:
+                structured_evidence_trustworthy = (
+                    _codex_jsonl_has_observed_activity(
+                        _iter_spooled_lines(result.stdout_file)
+                    )
+                    is not None
+                )
                 data = _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
                 if not data:
                     raise json.JSONDecodeError("No JSON", result.stdout_tail[:200], 0)
             elif provider == "openai" and "\n" in output_str:
+                structured_evidence_trustworthy = (
+                    _codex_jsonl_has_observed_activity(iter(output_str.splitlines()))
+                    is not None
+                )
                 data = _parse_codex_jsonl(output_str.splitlines())
             else:
+                try:
+                    _strict_json_object(output_str)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    structured_evidence_trustworthy = False
                 # Claude Code may emit non-JSON text to stdout (npm warnings,
                 # upgrade prompts) alongside the JSON result.  Try parsing as
                 # single JSON first, then fall back to line-by-line extraction.
@@ -9415,6 +9475,7 @@ def _run_with_provider(
                     ),
                     provider_attempt_receipt=receipt,
                     classification_detail=text if not success else None,
+                    evidence_trustworthy=structured_evidence_trustworthy,
                 )
             if provider == "openai":
                 raw_usage = data.get("usage") if isinstance(data, dict) else None
@@ -9431,8 +9492,15 @@ def _run_with_provider(
                     raw_usage if isinstance(raw_usage, dict) else None,
                     effective_codex_effort,
                     effective_codex_effort,
+                    evidence_trustworthy=structured_evidence_trustworthy,
                 )
-            return success, text, cost, actual_model
+            return _ProviderRunResult(
+                success,
+                text,
+                cost,
+                actual_model,
+                evidence_trustworthy=structured_evidence_trustworthy,
+            )
         except json.JSONDecodeError:
             # Invalid or incomplete provider output never becomes a public raw
             # snippet; retain only its fail-closed receipt classification.

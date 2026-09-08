@@ -416,6 +416,19 @@ def test_duplicate_anthropic_json_keys_are_ambiguous():
     assert receipt.work_disposition == "ambiguous"
 
 
+def test_duplicate_anthropic_success_bypass_is_demoted_at_public_boundary(tmp_path):
+    raw = json.dumps(_zero_work_rejection(), separators=(",", ":"))
+    contradictory = raw[:-1] + ',"is_error":false}'
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["anthropic"],
+        boundary_result=_completed(contradictory, returncode=0),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+    assert "sk-syntheticsecret" not in result.output_text
+
+
 def test_contradictory_stderr_prevents_not_started():
     receipt = ac._create_provider_attempt_receipt(
         "anthropic",
@@ -577,6 +590,25 @@ def test_opencode_mixed_unreviewed_jsonl_is_ambiguous(tail):
     assert receipt.work_disposition == "ambiguous"
 
 
+@pytest.mark.parametrize(
+    "tail",
+    ['{"type":', json.dumps({"type": "future.event"})],
+    ids=["malformed", "unknown-event"],
+)
+def test_opencode_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
+    stdout = "\n".join(
+        [json.dumps({"type": "text", "part": {"text": "useful output"}}), tail]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout, returncode=0),
+        )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
 def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
     stdout = io.BytesIO(b'{"type":"error","message":"synthetic failure"}\n')
     stderr = io.BytesIO(b"")
@@ -706,6 +738,73 @@ def test_codex_mixed_unreviewed_jsonl_is_ambiguous(tail):
     )
     receipt = ac._create_provider_attempt_receipt("openai", 1, 1, stdout, "")
     assert receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ['{"type":', json.dumps({"type": "future.event"})],
+    ids=["malformed", "unknown-event"],
+)
+def test_codex_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": "A sufficiently long synthetic answer.",
+                    },
+                }
+            ),
+            tail,
+        ]
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_completed(stdout, returncode=0),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        json.dumps(
+            {
+                "type": "result",
+                "result": "A sufficiently long synthetic Codex answer.",
+                "usage": {"input_tokens": float("inf"), "output_tokens": 0},
+            }
+        ),
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": "A sufficiently long synthetic Codex answer.",
+                        },
+                    }
+                ),
+                '{"type":"turn.completed","usage":{"input_tokens":1e309}}',
+            ]
+        ),
+    ],
+    ids=["single-json", "jsonl"],
+)
+def test_codex_nonfinite_exit_zero_usage_is_demoted(tmp_path, stdout):
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_completed(stdout, returncode=0),
+    )
+    assert result.success is False
+    assert result.cost_usd == 0
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
 def test_interactive_pty_failure_attaches_ambiguous_receipt(tmp_path):
