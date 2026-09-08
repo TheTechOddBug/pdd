@@ -1561,7 +1561,11 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             return None
         event_type = str(event.get("type") or "")
         if event_type == "message":
-            if event.get("role") == "assistant" and event.get("content"):
+            role = event.get("role")
+            content = event.get("content")
+            if role != "assistant" or not isinstance(content, str):
+                return None
+            if content:
                 observed_activity = True
             continue
         if event_type not in {

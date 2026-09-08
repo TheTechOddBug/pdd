@@ -767,6 +767,27 @@ def test_codex_legacy_assistant_message_before_failure_claims_started():
 
 
 @pytest.mark.parametrize(
+    "role,content",
+    [
+        ("assistant", ["not", "a", "string"]),
+        ("assistant", {"forged": "payload"}),
+        ("assistant", 1),
+        ("user", "synthetic prompt"),
+    ],
+)
+def test_codex_unreviewed_legacy_message_shape_is_ambiguous(role, content):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "init"}),
+            json.dumps({"type": "message", "role": role, "content": content}),
+            json.dumps({"type": "turn.failed"}),
+        ]
+    )
+    receipt = ac._create_provider_attempt_receipt("openai", 1, 1, stdout, "")
+    assert receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize(
     "tail",
     ['{"type":', json.dumps({"type": "future.event", "usage": {}})],
     ids=["malformed", "unknown-event"],
@@ -827,7 +848,13 @@ def test_codex_supported_legacy_init_remains_successful(tmp_path):
     stdout = "\n".join(
         [
             json.dumps({"type": "init"}),
-            json.dumps({"type": "message", "content": "synthetic progress"}),
+            json.dumps(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "synthetic progress",
+                }
+            ),
             json.dumps(
                 {
                     "type": "result",
