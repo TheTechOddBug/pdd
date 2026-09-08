@@ -8847,7 +8847,9 @@ def _run_with_provider(
                     )
                 return _ProviderRunResult(
                     False,
-                    _public_provider_failure_detail(receipt, result.returncode),
+                    _sanitize_comment_body(
+                        str(err), max_chars=MAX_ERROR_SNIPPET_LENGTH
+                    ),
                     cost,
                     actual_model,
                     provider_attempt_receipt=receipt,
@@ -8908,7 +8910,9 @@ def _run_with_provider(
                 )
                 return _ProviderRunResult(
                     False,
-                    _public_provider_failure_detail(receipt, result.returncode),
+                    _sanitize_comment_body(
+                        text, max_chars=MAX_ERROR_SNIPPET_LENGTH
+                    ),
                     0.0,
                     None,
                     provider_attempt_receipt=receipt,
