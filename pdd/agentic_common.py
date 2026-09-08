@@ -1538,6 +1538,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
         "init",
         "item.completed",
         "item.started",
+        "message",
         "result",
         "session.end",
         "session.failed",

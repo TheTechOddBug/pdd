@@ -809,6 +809,7 @@ def test_codex_supported_legacy_init_remains_successful(tmp_path):
     stdout = "\n".join(
         [
             json.dumps({"type": "init"}),
+            json.dumps({"type": "message", "content": "synthetic progress"}),
             json.dumps(
                 {
                     "type": "result",
