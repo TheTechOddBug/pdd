@@ -27,6 +27,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import (
+    AbstractSet,
     Any,
     Callable,
     Dict,
@@ -1493,7 +1494,7 @@ def _anthropic_cli_version_is_reviewed() -> bool:
     return re.fullmatch(r"2\.1\.263 \(Claude Code\)", version) is not None
 
 
-def _has_positive_counter(data: Any, names: Set[str]) -> bool:
+def _has_positive_counter(data: Any, names: AbstractSet[str]) -> bool:
     """Check only reviewed counter names in a provider-owned mapping."""
     return isinstance(data, Mapping) and any(
         _is_positive_number(data.get(name)) for name in names
@@ -1733,6 +1734,40 @@ def _codex_current_item_activity(
 ) -> Optional[bool]:
     """Validate Codex SDK item variants that can appear on the JSONL boundary."""
     item_type = item.get("type")
+    classifier_fields = {
+        "text",
+        "tool",
+        "tool_calls",
+        "command",
+        "aggregated_output",
+        "exit_code",
+        "status",
+        "changes",
+        "server",
+        "arguments",
+        "result",
+        "error",
+        "query",
+        "message",
+        "items",
+    }
+    allowed_by_type = {
+        "agent_message": {"text"},
+        "reasoning": {"text"},
+        "command_execution": {
+            "command", "aggregated_output", "exit_code", "status"
+        },
+        "file_change": {"changes", "status"},
+        "mcp_tool_call": {"server", "tool", "arguments", "result", "error", "status"},
+        "web_search": {"query"},
+        "todo_list": {"items"},
+        "error": {"message"},
+    }
+    allowed_fields = allowed_by_type.get(str(item_type))
+    if allowed_fields is None or any(
+        name in item and name not in allowed_fields for name in classifier_fields
+    ):
+        return None
     if item_type in {"agent_message", "reasoning"}:
         if not _codex_required_strings(item, {"id", "text"}):
             return None
@@ -1806,6 +1841,24 @@ def _codex_current_item_activity(
     return None
 
 
+def _codex_failure_event_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    """Validate every provider field used to extract a Codex failure detail."""
+    signal_keys = [
+        key
+        for key in ("error", "message", "detail", "reason", "output", "result")
+        if key in event
+    ]
+    if len(signal_keys) > 1:
+        return False
+    if signal_keys:
+        value = event[signal_keys[0]]
+        if signal_keys[0] == "error" and isinstance(value, Mapping):
+            value = value.get("message")
+        if not isinstance(value, str) or not value:
+            return False
+    return "is_error" not in event or isinstance(event.get("is_error"), bool)
+
+
 def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
     """Validate reviewed Codex completed-item shapes and classify activity."""
     if not isinstance(item, Mapping):
@@ -1875,6 +1928,9 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
         if not isinstance(event, Mapping) or event.get("type") not in known_types:
             return None
         event_type = str(event.get("type") or "")
+        if event_type in {"error", "turn.failed", "session.failed", "task.failed"}:
+            if not _codex_failure_event_shape_is_reviewed(event):
+                return None
         if "model" in event and not isinstance(event.get("model"), str):
             return None
         if "usage" in event and not _codex_usage_shape_is_reviewed(
@@ -1883,7 +1939,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             return None
         if "cost" in event and not _opencode_nonnegative_number(event["cost"]):
             return None
-        if _has_positive_counter(event.get("usage"), set(_CODEX_USAGE_FIELDS)):
+        if _has_positive_counter(event.get("usage"), _CODEX_USAGE_FIELDS):
             observed_activity = True
         if _is_positive_number(event.get("cost")):
             observed_activity = True
@@ -1929,30 +1985,6 @@ def _provider_has_observed_activity(provider: str, data: Mapping[str, Any]) -> b
                 model_data.get("tokens"), {"prompt", "candidates", "cached"}
             )
             for model_data in models.values()
-        )
-    if provider == "openai":
-        if data.get("type") not in {
-            "result", "item.completed", "session.end", "turn.completed"
-        }:
-            return False
-        usage = data.get("usage")
-        item = data.get("item")
-        return (
-            _has_positive_counter(
-                usage,
-                {
-                    "input_tokens",
-                    "output_tokens",
-                    "cached_input_tokens",
-                    "cache_creation_input_tokens",
-                    "cache_write_tokens",
-                },
-            )
-            or _is_positive_number(data.get("cost"))
-            or (
-                isinstance(item, Mapping)
-                and bool(item.get("text") or item.get("tool") or item.get("tool_calls"))
-            )
         )
     return False
 
@@ -2113,7 +2145,7 @@ def _create_provider_attempt_receipt(
         )
 
     try:
-        if safe_provider == "openai" and "\n" in stdout_text:
+        if safe_provider == "openai":
             observed_activity = _codex_jsonl_has_observed_activity(
                 iter(stdout_text.splitlines())
             )
@@ -2208,9 +2240,7 @@ def _create_provider_attempt_receipt(
         )
 
     if (
-        safe_provider == "openai"
-        and "\n" in stdout_text
-        and observed_activity
+        safe_provider == "openai" and observed_activity
     ) or _provider_has_observed_activity(safe_provider, parsed):
         return _new_provider_attempt_receipt(
             safe_provider, attempt_number, "provider_error", "started_or_billable"

@@ -1113,9 +1113,26 @@ def test_codex_started_tool_item_claims_started(tmp_path, returncode):
         {
             "type": "item.completed",
             "item": {
+                "id": "item_message",
                 "type": "agent_message",
                 "text": "synthetic output",
                 "tool_calls": [{"function": {"name": "forged"}}],
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "id": "item_reasoning",
+                "type": "reasoning",
+                "text": "synthetic reasoning",
+                "tool": "cross-variant",
+            },
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                **_codex_current_item_pair("command_execution")[1],
+                "tool_calls": [{"name": "cross-variant"}],
             },
         },
         {
@@ -1143,6 +1160,8 @@ def test_codex_started_tool_item_claims_started(tmp_path, returncode):
     ids=[
         "unknown-started-item",
         "agent-message-cross-field",
+        "reasoning-cross-field",
+        "command-cross-field",
         "tool-call-cross-field",
         "tool-output-cross-field",
         "contradictory-call-name",
@@ -1290,6 +1309,61 @@ def test_codex_failure_event_accounting_claims_started(
     )
     assert result.success is False
     assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "error",
+            "message": {"forged": "shape"},
+            "cost": 0.01,
+        },
+        {
+            "type": "turn.failed",
+            "error": 17,
+            "usage": {"input_tokens": 1},
+        },
+    ],
+    ids=["malformed-error-message", "malformed-failure-error"],
+)
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_codex_malformed_failure_shape_overrides_accounting(
+    tmp_path, event, returncode
+):
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(json.dumps(event), returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "type": "turn.completed",
+            "usage": {"reasoning_output_tokens": 1},
+        },
+        {
+            "type": "item.completed",
+            "item": _codex_current_item_pair("command_execution")[1],
+        },
+    ],
+    ids=["current-usage", "current-item"],
+)
+def test_codex_classification_is_newline_invariant(event):
+    raw = json.dumps(event)
+    without_newline = ac._create_provider_attempt_receipt(
+        "openai", 1, 1, raw, ""
+    )
+    with_newline = ac._create_provider_attempt_receipt(
+        "openai", 1, 1, raw + "\n", ""
+    )
+    assert without_newline.work_disposition == "started_or_billable"
+    assert with_newline.work_disposition == without_newline.work_disposition
 
 
 def test_codex_unknown_positive_usage_field_does_not_claim_started():
