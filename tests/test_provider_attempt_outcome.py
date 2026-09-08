@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -90,14 +91,44 @@ def _zero_work_rejection() -> dict[str, Any]:
 
 
 @pytest.fixture(autouse=True)
-def _reset_provider_state():
-    with patch(
-        "pdd.agentic_common._get_provider_cli_version",
-        return_value="2.1.263 (Claude Code)",
-    ):
+def _reset_provider_state(request):
+    version_boundary = (
+        nullcontext()
+        if request.node.get_closest_marker("uses_real_cli_detector")
+        else patch(
+            "pdd.agentic_common._get_provider_cli_version",
+            return_value="2.1.263 (Claude Code)",
+        )
+    )
+    with version_boundary:
+        ac._PROVIDER_CLI_VERSION_CACHE.clear()
         ac.reset_disabled_providers()
         yield
         ac.reset_disabled_providers()
+        ac._PROVIDER_CLI_VERSION_CACHE.clear()
+
+
+def _write_fake_claude_executable(tmp_path: Path) -> Path:
+    """Create an offline Claude boundary that is still a real OS process."""
+    cli_dir = tmp_path / "fake-bin"
+    cli_dir.mkdir()
+    cli_path = cli_dir / "claude"
+    cli_path.write_text(
+        """#!/bin/sh
+if [ "${1-}" = "--version" ]; then
+    printf '%s\\n' "$PDD_FAKE_CLAUDE_VERSION"
+    printf '%s\\n' version >> "$PDD_FAKE_CLAUDE_EVENTS"
+    exit 0
+fi
+while IFS= read -r _line; do :; done
+printf '%s\\n' attempt >> "$PDD_FAKE_CLAUDE_EVENTS"
+printf '%s\\n' "$PDD_FAKE_CLAUDE_PAYLOAD"
+exit 1
+""",
+        encoding="utf-8",
+    )
+    cli_path.chmod(0o755)
+    return cli_path
 
 
 def _completed(stdout: str, *, returncode: int = 1, stderr: str = ""):
@@ -835,3 +866,78 @@ def test_single_attempt_false_positive_diagnostic_does_not_echo_private_ids(tmp_
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
     assert "req_PRIVATE" not in result.output_text
     assert "sess_PRIVATE" not in result.output_text
+
+
+@pytest.mark.uses_real_cli_detector
+@pytest.mark.parametrize(
+    ("version", "failure_kind", "work_disposition"),
+    [
+        (
+            "2.1.263 (Claude Code)",
+            "credential_or_account",
+            "not_started",
+        ),
+        (
+            "2.1.119 (Claude Code)",
+            "unknown",
+            "ambiguous",
+        ),
+    ],
+)
+def test_fake_claude_executable_exercises_public_receipt_end_to_end(
+    tmp_path,
+    version,
+    failure_kind,
+    work_disposition,
+):
+    """Exercise discovery, process capture, classification, and serialization."""
+    fake_cli = _write_fake_claude_executable(tmp_path)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    event_log = tmp_path / "claude-events.log"
+    raw = json.dumps(_zero_work_rejection(), separators=(",", ":"))
+    isolated_env = {
+        "HOME": str(fake_home),
+        "PATH": str(fake_cli.parent),
+        "PDD_AGENTIC_PROVIDER": "anthropic",
+        "PDD_AUTO_UPDATE": "false",
+        "PDD_FAKE_CLAUDE_EVENTS": str(event_log),
+        "PDD_FAKE_CLAUDE_PAYLOAD": raw,
+        "PDD_FAKE_CLAUDE_VERSION": version,
+    }
+
+    with patch.dict(os.environ, isolated_env, clear=True):
+        result = ac.run_agentic_task(
+            "synthetic black-box receipt check",
+            tmp_path,
+            quiet=True,
+            max_retries=7,
+            single_provider_attempt=True,
+            background_safe=True,
+        )
+
+    assert event_log.read_text(encoding="utf-8").splitlines() == [
+        "attempt",
+        "version",
+    ]
+    assert result.success is False
+
+    serialized = result.to_dict()
+    assert serialized["provider_attempt_receipt"] == {
+        "schema_version": "pdd.provider_attempt.v1",
+        "provider": "anthropic",
+        "attempt_number": 1,
+        "failure_kind": failure_kind,
+        "work_disposition": work_disposition,
+    }
+    assert len(result.output_text) <= 500
+
+    serialized_text = json.dumps(serialized, sort_keys=True)
+    for private_value in (
+        "sk-syntheticsecret",
+        "11111111-2222-4333-8444-555555555555",
+        "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        '"duration_api_ms"',
+    ):
+        assert private_value not in result.output_text
+        assert private_value not in serialized_text
