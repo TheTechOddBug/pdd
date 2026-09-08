@@ -748,6 +748,24 @@ def test_codex_unknown_positive_usage_field_does_not_claim_started():
     assert receipt.work_disposition == "ambiguous"
 
 
+def test_codex_legacy_assistant_message_before_failure_claims_started():
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "init"}),
+            json.dumps(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "A substantive synthetic answer.",
+                }
+            ),
+            json.dumps({"type": "turn.failed"}),
+        ]
+    )
+    receipt = ac._create_provider_attempt_receipt("openai", 1, 1, stdout, "")
+    assert receipt.work_disposition == "started_or_billable"
+
+
 @pytest.mark.parametrize(
     "tail",
     ['{"type":', json.dumps({"type": "future.event", "usage": {}})],

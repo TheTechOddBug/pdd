@@ -1560,6 +1560,10 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
         if not isinstance(event, Mapping) or event.get("type") not in known_types:
             return None
         event_type = str(event.get("type") or "")
+        if event_type == "message":
+            if event.get("role") == "assistant" and event.get("content"):
+                observed_activity = True
+            continue
         if event_type not in {
             "result", "item.completed", "session.end", "turn.completed"
         }:
