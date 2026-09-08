@@ -1510,6 +1510,7 @@ def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
         "text",
         "tool_use",
     }
+    observed_activity = False
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -1519,11 +1520,46 @@ def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
             return None
         if not isinstance(event, Mapping) or event.get("type") not in known_types:
             return None
+        event_type = event.get("type")
+        if event_type in {"step_start", "tool_use"}:
+            timestamp = event.get("timestamp")
+            session_id = event.get("sessionID")
+            part = event.get("part")
+            if (
+                isinstance(timestamp, bool)
+                or not isinstance(timestamp, (int, float))
+                or not math.isfinite(timestamp)
+                or not isinstance(session_id, str)
+                or not session_id
+                or not isinstance(part, Mapping)
+                or not all(
+                    isinstance(part.get(key), str) and part.get(key)
+                    for key in ("id", "sessionID", "messageID")
+                )
+                or part.get("sessionID") != session_id
+            ):
+                return None
+            if event_type == "step_start":
+                if part.get("type") != "step-start":
+                    return None
+            else:
+                state = part.get("state")
+                if (
+                    part.get("type") != "tool"
+                    or not isinstance(part.get("callID"), str)
+                    or not part.get("callID")
+                    or not isinstance(part.get("tool"), str)
+                    or not part.get("tool")
+                    or not isinstance(state, Mapping)
+                    or state.get("status") not in {"completed", "error"}
+                ):
+                    return None
+            observed_activity = True
     try:
         parsed = _parse_opencode_jsonl(stdout)
     except (OverflowError, TypeError, ValueError):
         return False
-    return bool(parsed.get("text")) or _is_positive_number(
+    return observed_activity or bool(parsed.get("text")) or _is_positive_number(
         parsed.get("cost")
     ) or _has_positive_counter(
         parsed.get("tokens"),

@@ -103,6 +103,37 @@ def _completed(stdout: str, *, returncode: int = 1, stderr: str = ""):
     )
 
 
+def _opencode_step_start() -> dict[str, Any]:
+    return {
+        "type": "step_start",
+        "timestamp": 1,
+        "sessionID": "ses_synthetic",
+        "part": {
+            "id": "prt_start",
+            "sessionID": "ses_synthetic",
+            "messageID": "msg_synthetic",
+            "type": "step-start",
+        },
+    }
+
+
+def _opencode_tool_use() -> dict[str, Any]:
+    return {
+        "type": "tool_use",
+        "timestamp": 2,
+        "sessionID": "ses_synthetic",
+        "part": {
+            "id": "prt_tool",
+            "sessionID": "ses_synthetic",
+            "messageID": "msg_synthetic",
+            "type": "tool",
+            "callID": "call_synthetic",
+            "tool": "synthetic-tool",
+            "state": {"status": "completed"},
+        },
+    }
+
+
 def _run_public(
     tmp_path: Path,
     *,
@@ -614,10 +645,55 @@ def test_opencode_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
+@pytest.mark.parametrize(
+    "event",
+    [_opencode_step_start(), _opencode_tool_use()],
+    ids=["request-accepted", "tool-used"],
+)
+def test_opencode_reviewed_boundary_activity_claims_started(event):
+    stdout = "\n".join(
+        [json.dumps(event), json.dumps({"type": "error", "message": "failed"})]
+    )
+    receipt = ac._create_provider_attempt_receipt("opencode", 1, 1, stdout, "")
+    assert receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "step_start"},
+        {
+            **_opencode_tool_use(),
+            "part": {**_opencode_tool_use()["part"], "callID": 1},
+        },
+        {
+            **_opencode_tool_use(),
+            "part": {
+                **_opencode_tool_use()["part"],
+                "state": {"status": "running"},
+            },
+        },
+        {
+            **_opencode_step_start(),
+            "part": {
+                **_opencode_step_start()["part"],
+                "sessionID": "ses_other",
+            },
+        },
+    ],
+    ids=["missing-envelope", "bad-call-id", "unemitted-status", "session-mismatch"],
+)
+def test_opencode_unreviewed_activity_shape_is_ambiguous(event):
+    receipt = ac._create_provider_attempt_receipt(
+        "opencode", 1, 1, json.dumps(event), ""
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
 def test_opencode_supported_session_end_remains_successful(tmp_path):
     stdout = "\n".join(
         [
-            json.dumps({"type": "step_start"}),
+            json.dumps(_opencode_step_start()),
             json.dumps(
                 {
                     "type": "text",
@@ -641,9 +717,31 @@ def test_opencode_supported_session_end_remains_successful(tmp_path):
 def test_opencode_short_text_false_positive_preserves_started_receipt(tmp_path):
     stdout = "\n".join(
         [
-            json.dumps({"type": "step_start"}),
+            json.dumps(_opencode_step_start()),
             json.dumps({"type": "text", "part": {"text": "OK"}}),
             json.dumps({"type": "step_finish", "part": {"cost": 0}}),
+            json.dumps({"type": "session.end", "model": "synthetic/model"}),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout, returncode=0),
+        )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [_opencode_step_start(), _opencode_tool_use()],
+    ids=["request-accepted", "tool-used"],
+)
+def test_opencode_exit_zero_activity_preserves_started_receipt(tmp_path, event):
+    stdout = "\n".join(
+        [
+            json.dumps(event),
             json.dumps({"type": "session.end", "model": "synthetic/model"}),
         ]
     )
