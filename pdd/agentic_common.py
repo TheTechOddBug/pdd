@@ -1502,7 +1502,14 @@ def _has_positive_counter(data: Any, names: Set[str]) -> bool:
 
 def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
     """Recognize activity, returning ``None`` for unreviewed JSONL evidence."""
-    known_types = {"error", "step_start", "step_finish", "text", "tool_use"}
+    known_types = {
+        "error",
+        "session.end",
+        "step_start",
+        "step_finish",
+        "text",
+        "tool_use",
+    }
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -1528,6 +1535,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
     """Recognize work-bearing events, or ``None`` for unreviewed JSONL."""
     known_types = {
         "error",
+        "init",
         "item.completed",
         "item.started",
         "result",
@@ -6367,13 +6375,14 @@ def run_agentic_task(
                 )
                 if not math.isfinite(cost) or _contains_nonfinite_number(usage):
                     evidence_trustworthy = False
+                if single_provider_attempt and not evidence_trustworthy:
                     cost = 0.0
                     usage = None
-                if single_provider_attempt and success and not evidence_trustworthy:
-                    success = False
                     internal_receipt = _new_provider_attempt_receipt(
                         provider, attempt, "unknown", "ambiguous"
                     )
+                    if success:
+                        success = False
                 cumulative_cost_usd += cost
                 total_cost += cost
                 if single_provider_attempt and not success:

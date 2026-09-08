@@ -597,7 +597,11 @@ def test_opencode_mixed_unreviewed_jsonl_is_ambiguous(tail):
 )
 def test_opencode_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
     stdout = "\n".join(
-        [json.dumps({"type": "text", "part": {"text": "useful output"}}), tail]
+        [
+            json.dumps({"type": "text", "part": {"text": "useful output"}}),
+            json.dumps({"type": "step_finish", "part": {"cost": 0.01}}),
+            tail,
+        ]
     )
     with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
         result, _, _ = _run_public(
@@ -606,7 +610,32 @@ def test_opencode_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
             boundary_result=_completed(stdout, returncode=0),
         )
     assert result.success is False
+    assert result.cost_usd == 0
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+def test_opencode_supported_session_end_remains_successful(tmp_path):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "step_start"}),
+            json.dumps(
+                {
+                    "type": "text",
+                    "part": {"text": "A sufficiently long OpenCode answer."},
+                }
+            ),
+            json.dumps({"type": "step_finish", "part": {"cost": 0.01}}),
+            json.dumps({"type": "session.end", "model": "synthetic/model"}),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout, returncode=0),
+        )
+    assert result.success is True
+    assert result.provider_attempt_receipt is None
 
 
 def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
@@ -757,6 +786,12 @@ def test_codex_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
                     },
                 }
             ),
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ),
             tail,
         ]
     )
@@ -766,7 +801,30 @@ def test_codex_exit_zero_unreviewed_tail_is_demoted(tmp_path, tail):
         boundary_result=_completed(stdout, returncode=0),
     )
     assert result.success is False
+    assert result.cost_usd == 0
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+def test_codex_supported_legacy_init_remains_successful(tmp_path):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "init"}),
+            json.dumps(
+                {
+                    "type": "result",
+                    "output": "A sufficiently long legacy Codex answer.",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                }
+            ),
+        ]
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_completed(stdout, returncode=0),
+    )
+    assert result.success is True
+    assert result.provider_attempt_receipt is None
 
 
 @pytest.mark.parametrize(
