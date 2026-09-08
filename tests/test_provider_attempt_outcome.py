@@ -150,6 +150,38 @@ def _opencode_tool_use() -> dict[str, Any]:
     }
 
 
+def _codex_current_item_pair(item_type: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    if item_type == "command_execution":
+        base = {
+            "id": "item_command",
+            "type": item_type,
+            "command": "true",
+            "aggregated_output": "",
+        }
+        return ({**base, "status": "in_progress"}, {**base, "status": "completed", "exit_code": 0})
+    if item_type == "file_change":
+        base = {
+            "id": "item_file",
+            "type": item_type,
+            "changes": [{"path": "synthetic.txt", "kind": "update"}],
+        }
+        completed = {**base, "status": "completed"}
+        return (completed, completed)
+    if item_type == "mcp_tool_call":
+        base = {
+            "id": "item_mcp",
+            "type": item_type,
+            "server": "synthetic-server",
+            "tool": "synthetic-tool",
+            "arguments": {},
+        }
+        return ({**base, "status": "in_progress"}, {**base, "status": "completed", "result": {}})
+    if item_type == "web_search":
+        item = {"id": "item_search", "type": item_type, "query": "synthetic"}
+        return (item, item)
+    raise AssertionError(f"unsupported synthetic item type: {item_type}")
+
+
 def _run_public(
     tmp_path: Path,
     *,
@@ -1161,6 +1193,96 @@ def test_codex_started_agent_message_proves_acceptance(tmp_path, returncode):
         )
         + "\n"
     )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "item_type",
+    ["command_execution", "file_change", "mcp_tool_call", "web_search"],
+)
+def test_codex_current_tool_items_claim_started(tmp_path, item_type, returncode):
+    started_item, completed_item = _codex_current_item_pair(item_type)
+    stdout = (
+        "\n".join(
+            [
+                json.dumps({"type": "item.started", "item": started_item}),
+                json.dumps({"type": "item.completed", "item": completed_item}),
+                json.dumps({"type": "turn.failed"}),
+            ]
+        )
+        + "\n"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+def test_codex_current_tool_stream_preserves_exit_zero_success(tmp_path):
+    started_item, completed_item = _codex_current_item_pair("command_execution")
+    stdout = (
+        "\n".join(
+            [
+                json.dumps({"type": "item.started", "item": started_item}),
+                json.dumps({"type": "item.completed", "item": completed_item}),
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "id": "item_message",
+                            "type": "agent_message",
+                            "text": "A sufficiently long synthetic Codex answer.",
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=0),
+    )
+    assert result.success is True
+    assert result.provider_attempt_receipt is None
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "event_type", ["turn.failed", "session.failed", "task.failed", "error"]
+)
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"usage": {"input_tokens": 1, "output_tokens": 0}},
+        {"cost": 0.01},
+    ],
+    ids=["usage", "cost"],
+)
+def test_codex_failure_event_accounting_claims_started(
+    tmp_path, event_type, evidence, returncode
+):
+    event = {"type": event_type, **evidence}
+    if event_type == "error":
+        event["message"] = "synthetic failure"
+    stdout = json.dumps(event) + "\n"
     result, _, _ = _run_public(
         tmp_path,
         providers=["openai"],

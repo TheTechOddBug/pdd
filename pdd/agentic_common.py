@@ -1685,6 +1685,8 @@ _CODEX_USAGE_FIELDS = frozenset(
         "cached_input_tokens",
         "cache_creation_input_tokens",
         "cache_write_tokens",
+        "cache_write_input_tokens",
+        "reasoning_output_tokens",
     }
 )
 
@@ -1717,6 +1719,93 @@ def _codex_tool_calls_shape_is_reviewed(value: Any) -> bool:
     return True
 
 
+def _codex_required_strings(item: Mapping[str, Any], names: Set[str]) -> bool:
+    return all(isinstance(item.get(name), str) and item.get(name) for name in names)
+
+
+def _codex_status_is_reviewed(status: Any, *, started: bool) -> bool:
+    allowed = {"in_progress"} if started else {"completed", "failed"}
+    return isinstance(status, str) and status in allowed
+
+
+def _codex_current_item_activity(
+    item: Mapping[str, Any], *, started: bool
+) -> Optional[bool]:
+    """Validate Codex SDK item variants that can appear on the JSONL boundary."""
+    item_type = item.get("type")
+    if item_type in {"agent_message", "reasoning"}:
+        if not _codex_required_strings(item, {"id", "text"}):
+            return None
+        return True if started else bool(item["text"])
+    if item_type == "command_execution":
+        if not _codex_required_strings(item, {"id", "command"}):
+            return None
+        if not isinstance(item.get("aggregated_output"), str):
+            return None
+        if not _codex_status_is_reviewed(item.get("status"), started=started):
+            return None
+        exit_code = item.get("exit_code")
+        if exit_code is not None and (
+            isinstance(exit_code, bool) or not isinstance(exit_code, int)
+        ):
+            return None
+        return True
+    if item_type == "file_change":
+        changes = item.get("changes")
+        if (
+            not _codex_required_strings(item, {"id"})
+            or not isinstance(changes, list)
+            or not all(
+                isinstance(change, Mapping)
+                and _codex_required_strings(change, {"path"})
+                and change.get("kind") in {"add", "delete", "update"}
+                for change in changes
+            )
+            or item.get("status") not in {"completed", "failed"}
+        ):
+            return None
+        return True
+    if item_type == "mcp_tool_call":
+        if not _codex_required_strings(item, {"id", "server", "tool"}):
+            return None
+        if "arguments" not in item or not _codex_status_is_reviewed(
+            item.get("status"), started=started
+        ):
+            return None
+        if "result" in item and not isinstance(item.get("result"), Mapping):
+            return None
+        error = item.get("error")
+        if error is not None and (
+            not isinstance(error, Mapping)
+            or not isinstance(error.get("message"), str)
+        ):
+            return None
+        if "result" in item and "error" in item:
+            return None
+        return True
+    if item_type == "web_search":
+        return True if _codex_required_strings(item, {"id", "query"}) else None
+    if item_type == "todo_list":
+        todos = item.get("items")
+        if (
+            not _codex_required_strings(item, {"id"})
+            or not isinstance(todos, list)
+            or not all(
+                isinstance(todo, Mapping)
+                and isinstance(todo.get("text"), str)
+                and isinstance(todo.get("completed"), bool)
+                for todo in todos
+            )
+        ):
+            return None
+        return True
+    if item_type == "error":
+        if not _codex_required_strings(item, {"id", "message"}):
+            return None
+        return True if started else False
+    return None
+
+
 def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
     """Validate reviewed Codex completed-item shapes and classify activity."""
     if not isinstance(item, Mapping):
@@ -1724,6 +1813,16 @@ def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
     if "id" in item and not isinstance(item.get("id"), str):
         return None
     item_type = item.get("type")
+    if item_type in {
+        "reasoning",
+        "command_execution",
+        "file_change",
+        "mcp_tool_call",
+        "web_search",
+        "todo_list",
+        "error",
+    } or (item_type == "agent_message" and "id" in item):
+        return _codex_current_item_activity(item, started=started)
     if item_type == "agent_message":
         if "tool" in item or "tool_calls" in item:
             return None
@@ -1744,8 +1843,6 @@ def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
         return True if _codex_tool_calls_shape_is_reviewed(
             item.get("tool_calls")
         ) else None
-    if item_type is None:
-        return None
     return None
 
 
@@ -1784,6 +1881,12 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             event["usage"]
         ):
             return None
+        if "cost" in event and not _opencode_nonnegative_number(event["cost"]):
+            return None
+        if _has_positive_counter(event.get("usage"), set(_CODEX_USAGE_FIELDS)):
+            observed_activity = True
+        if _is_positive_number(event.get("cost")):
+            observed_activity = True
         if event_type == "message":
             role = event.get("role")
             content = event.get("content")
@@ -1808,17 +1911,6 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             "result", "session.end", "turn.completed"
         }:
             continue
-        if _has_positive_counter(
-            event.get("usage"),
-            {
-                "input_tokens",
-                "output_tokens",
-                "cached_input_tokens",
-                "cache_creation_input_tokens",
-                "cache_write_tokens",
-            },
-        ):
-            observed_activity = True
     return observed_activity
 
 
