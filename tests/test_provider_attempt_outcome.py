@@ -638,6 +638,25 @@ def test_opencode_supported_session_end_remains_successful(tmp_path):
     assert result.provider_attempt_receipt is None
 
 
+def test_opencode_short_text_false_positive_preserves_started_receipt(tmp_path):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "step_start"}),
+            json.dumps({"type": "text", "part": {"text": "OK"}}),
+            json.dumps({"type": "step_finish", "part": {"cost": 0}}),
+            json.dumps({"type": "session.end", "model": "synthetic/model"}),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout, returncode=0),
+        )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
 def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
     stdout = io.BytesIO(b'{"type":"error","message":"synthetic failure"}\n')
     stderr = io.BytesIO(b"")

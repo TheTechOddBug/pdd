@@ -9298,9 +9298,10 @@ def _run_with_provider(
         # error...) and routes cost via ``step_finish.part.cost``, so it doesn't
         # belong in the shared single-JSON / Codex-NDJSON path below.
         if provider == "opencode":
-            opencode_evidence_trustworthy = (
-                _opencode_jsonl_has_observed_activity(result.stdout) is not None
+            opencode_observed_activity = _opencode_jsonl_has_observed_activity(
+                result.stdout
             )
+            opencode_evidence_trustworthy = opencode_observed_activity is not None
             parsed = _parse_opencode_jsonl(result.stdout)
             actual_model = parsed.get("model") or None
             err = parsed.get("error") or ""
@@ -9350,6 +9351,7 @@ def _run_with_provider(
                 actual_model,
                 parsed.get("tokens"),
                 evidence_trustworthy=opencode_evidence_trustworthy,
+                observed_activity=opencode_observed_activity is True,
             )
 
         # Diagnostic: capture when CLI exits 0 with empty / whitespace-only stdout.
