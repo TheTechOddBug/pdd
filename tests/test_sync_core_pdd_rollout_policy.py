@@ -357,6 +357,9 @@ PREAUTHORIZED_CHILD_PATHS = (
         "user_stories/story__pdd_generation_gates_preserved.md",
         "user_stories/contracts/provider_attempt_outcome.contract.md",
         "user_stories/story__provider_attempt_outcome.md",
+        "tests/test_provider_attempt_outcome.py",
+        "tests/test_provider_attempt_outcome_codex.py",
+        "tests/test_provider_attempt_outcome_opencode.py",
         ".pdd/meta/agentic_architecture_python.json",
         ".pdd/meta/commands_generate_python.json",
         ".pdd/meta/user_story_tests_python.json",
@@ -2598,6 +2601,97 @@ def test_conformance_split_profiles_load_from_actual_merge_base() -> None:
     assert profiles.coverage == 1.0
 
 
+def _provider_attempt_repair_case(
+    monkeypatch,
+    *,
+    repository_id: str = REPOSITORY_ID,
+    base_prompt_suffix: bytes = b"",
+    head_prompt_suffix: bytes = b"",
+    head_profile_suffix: bytes = b"",
+    include_stale_reason: bool = True,
+):
+    """Call the #2422 stale-profile repair with controlled exact blobs."""
+    prompt_path = PurePosixPath("pdd/prompts/agentic_common_python.prompt")
+    unit_id = UnitId(repository_id, prompt_path, "python")
+    manifest = SimpleNamespace(
+        repository_id=repository_id,
+        base_ref="provider-attempt-base",
+        head_ref="provider-attempt-head",
+        expected_managed=(unit_id,),
+    )
+    old_requirement = b"23b9d4b69d1ae9a46fcd40281a552eeb110a69ae3d6210c21e0e5ad3901b8e40"
+    new_requirement = b"2e8f5569da07464e11343b3317a18e01980ad890b39ba7a0cd3bff5084d5d434"
+    head_profile = PROFILE_FILE.read_bytes()
+    base_profile = head_profile.replace(new_requirement, old_requirement)
+    rotations = ROTATION_FILE.read_bytes()
+    prompt = (ROOT / prompt_path).read_bytes()
+    blobs = {
+        (manifest.base_ref, PROFILE_REL_PATH): base_profile,
+        (manifest.head_ref, PROFILE_REL_PATH): head_profile + head_profile_suffix,
+        (manifest.base_ref, verification.ROTATION_POLICY_PATH): rotations,
+        (manifest.head_ref, verification.ROTATION_POLICY_PATH): rotations,
+        (manifest.base_ref, prompt_path): prompt + base_prompt_suffix,
+        (manifest.head_ref, prompt_path): prompt + head_prompt_suffix,
+    }
+    monkeypatch.setattr(
+        verification,
+        "read_git_blob",
+        lambda _root, ref, path: blobs.get((ref, path)),
+    )
+    profile = verification._ProfileInput((), ())  # pylint: disable=protected-access
+    stale_reason = (
+        f"{manifest.base_ref}: {prompt_path}: profile requirements "
+        "do not match immutable prompt requirements"
+    )
+    base_invalid = ["unrelated protected-base error"]
+    if include_stale_reason:
+        base_invalid.insert(0, stale_reason)
+    result = verification._authorized_sync_rollout_profile_reconciliation(  # pylint: disable=protected-access
+        ROOT,
+        manifest,
+        ({}, {unit_id: profile}),
+        base_invalid,
+        {},
+    )
+    return result, unit_id, profile, stale_reason
+
+
+def test_provider_attempt_profile_repair_is_exact_and_preserves_other_errors(
+    monkeypatch,
+) -> None:
+    """The omitted #2422 row is repaired without suppressing another error."""
+    (additions, reconciled), unit_id, profile, stale_reason = (
+        _provider_attempt_repair_case(monkeypatch)
+    )
+
+    assert additions == {unit_id: profile}
+    assert reconciled == frozenset({stale_reason})
+    assert "unrelated protected-base error" not in reconciled
+
+
+@pytest.mark.parametrize(
+    ("case", "overrides"),
+    (
+        ("foreign repository", {"repository_id": "foreign-repository"}),
+        ("changed base prompt", {"base_prompt_suffix": b"candidate mutation"}),
+        ("changed head prompt", {"head_prompt_suffix": b"candidate mutation"}),
+        ("wrong profile pair", {"head_profile_suffix": b"candidate mutation"}),
+        ("missing stale reason", {"include_stale_reason": False}),
+    ),
+)
+def test_provider_attempt_profile_repair_fails_closed(
+    monkeypatch, case: str, overrides: dict[str, object]
+) -> None:
+    """Every repository, byte, and diagnostic guard is mandatory."""
+    del case
+    (additions, reconciled), _unit_id, _profile, _stale_reason = (
+        _provider_attempt_repair_case(monkeypatch, **overrides)
+    )
+
+    assert additions == {}
+    assert reconciled == frozenset()
+
+
 def test_pr2017_phase_a_is_dormant_on_its_exact_protected_base() -> None:
     """The PR #2017 prerequisite installs authority without consuming bytes."""
     skip_if_authenticated_candidate_lacks_refs(
@@ -2668,6 +2762,10 @@ def test_sync_rollout_repair_executes_the_actual_protected_transition() -> None:
         (
             verification._SYNC_ROLLOUT_REPAIR_PROFILE_BYTES[0],  # pylint: disable=protected-access
             verification._STORY_PROMPT_PHASE_B_PROFILE_BYTES[1],  # pylint: disable=protected-access
+        ),
+        (
+            verification._SYNC_ROLLOUT_REPAIR_PROFILE_BYTES[0],  # pylint: disable=protected-access
+            verification._PROVIDER_ATTEMPT_PROFILE_BYTES[1],  # pylint: disable=protected-access
         ),
     }
     assert (
@@ -2949,6 +3047,11 @@ def test_current_profile_reconciliation_matches_current_prompt_and_profile_rows(
     current_rows.extend(
         _requirement_authorization_row(authorization)
         for authorization in verification._PR2376_DEPENDENCY_FIX_REQUIREMENT_TRANSITIONS  # pylint: disable=protected-access
+        if authorization.bindings.head_policy_sha256 == profile_digest
+    )
+    current_rows.extend(
+        _requirement_authorization_row(authorization)
+        for authorization in verification._PROVIDER_ATTEMPT_REQUIREMENT_TRANSITIONS  # pylint: disable=protected-access
         if authorization.bindings.head_policy_sha256 == profile_digest
     )
     if profile_digest == verification._SYNC_ROLLOUT_REPAIR_PROFILE_BYTES[1]:  # pylint: disable=protected-access
