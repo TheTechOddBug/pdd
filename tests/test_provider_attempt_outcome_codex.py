@@ -165,12 +165,19 @@ def test_codex_positive_usage_wins_over_simultaneous_auth_text(tmp_path):
     "item",
     [
         {"type": "tool_call", "tool": "synthetic-tool"},
+        {"type": "tool_call", "name": "shell", "output": "synthetic.txt"},
         {
             "type": "tool_output",
             "tool_calls": [{"function": {"name": "synthetic-tool"}}],
         },
+        {"type": "tool_output", "text": "synthetic tool output"},
     ],
-    ids=["tool-call", "tool-output"],
+    ids=[
+        "tool-call",
+        "legacy-named-tool-call",
+        "tool-output",
+        "legacy-text-tool-output",
+    ],
 )
 def test_codex_reviewed_tool_item_claims_started(item):
     stdout = "\n".join(
@@ -190,8 +197,23 @@ def test_codex_reviewed_tool_item_claims_started(item):
         {"type": "agent_message", "text": {"forged": "shape"}},
         {"type": "tool_call", "tool": {"forged": "shape"}},
         {"type": "tool_output", "tool_calls": ["not-an-object"]},
+        {"type": "tool_call", "name": "shell", "output": 7},
+        {"type": "tool_output", "text": {"forged": "shape"}},
+        {
+            "type": "tool_call",
+            "tool": "synthetic-tool",
+            "name": "cross-variant",
+            "output": "cross-variant",
+        },
     ],
-    ids=["agent-message-text", "tool-name", "tool-calls"],
+    ids=[
+        "agent-message-text",
+        "tool-name",
+        "tool-calls",
+        "legacy-tool-output-type",
+        "legacy-output-text-type",
+        "mixed-tool-call-unions",
+    ],
 )
 def test_codex_malformed_modern_item_is_ambiguous(tmp_path, item, returncode):
     stdout = (
@@ -646,6 +668,18 @@ def test_codex_unhashable_event_type_remains_ambiguous(tmp_path, returncode):
             json.dumps({"type": [], "usage": {"input_tokens": 1}}),
             returncode=returncode,
         ),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_codex_deeply_nested_json_remains_ambiguous(tmp_path, returncode):
+    stdout = "[" * 900 + "0" + "]" * 900
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
     )
     assert result.success is False
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"

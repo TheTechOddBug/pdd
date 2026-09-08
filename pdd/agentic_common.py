@@ -1845,7 +1845,7 @@ _CODEX_CURRENT_ITEM_FIELDS = {
     "error": frozenset({"message"}),
 }
 _CODEX_CLASSIFIER_FIELDS = frozenset().union(*_CODEX_CURRENT_ITEM_FIELDS.values()) | {
-    "tool_calls"
+    "tool_calls", "name", "output"
 }
 
 
@@ -2057,17 +2057,24 @@ def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
             return None
         return True if started else bool(text)
     if item_type == "tool_call":
-        if any(
-            name in item and name != "tool" for name in _CODEX_CLASSIFIER_FIELDS
-        ):
+        present = {name for name in _CODEX_CLASSIFIER_FIELDS if name in item}
+        if present == {"tool"}:
+            tool = item.get("tool")
+            return True if isinstance(tool, str) and tool else None
+        if present != {"name", "output"}:
             return None
-        tool = item.get("tool")
-        return True if isinstance(tool, str) and tool else None
+        return (
+            True
+            if isinstance(item.get("name"), str)
+            and bool(item.get("name"))
+            and isinstance(item.get("output"), str)
+            else None
+        )
     if item_type == "tool_output":
-        if any(
-            name in item and name != "tool_calls"
-            for name in _CODEX_CLASSIFIER_FIELDS
-        ):
+        present = {name for name in _CODEX_CLASSIFIER_FIELDS if name in item}
+        if present == {"text"}:
+            return True if isinstance(item.get("text"), str) else None
+        if present != {"tool_calls"}:
             return None
         return True if _codex_tool_calls_shape_is_reviewed(
             item.get("tool_calls")
@@ -2154,7 +2161,7 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
     """Fail closed if any untrusted Codex value defeats a schema validator."""
     try:
         return _scan_codex_jsonl_activity(lines)
-    except (OverflowError, TypeError, ValueError):
+    except (OverflowError, RecursionError, TypeError, ValueError):
         return None
 
 
@@ -2344,7 +2351,7 @@ def _create_provider_attempt_receipt(
             parsed = _parse_codex_jsonl(stdout_text.splitlines())
         else:
             parsed = _strict_json_object(stdout_text.strip())
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
         combined_text = "\n".join(
             part for part in (stdout_text, stderr_text) if part
         )
@@ -9997,7 +10004,11 @@ def _run_with_provider(
                 )
                 structured_evidence_trustworthy = codex_observed_activity is not None
                 structured_observed_activity = codex_observed_activity is True
-                data = _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
+                data = (
+                    _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
+                    if structured_evidence_trustworthy
+                    else {}
+                )
                 if not data:
                     raise json.JSONDecodeError("No JSON", result.stdout_tail[:200], 0)
             elif provider == "openai":
@@ -10006,7 +10017,11 @@ def _run_with_provider(
                 )
                 structured_evidence_trustworthy = codex_observed_activity is not None
                 structured_observed_activity = codex_observed_activity is True
-                data = _parse_codex_jsonl(output_str.splitlines())
+                data = (
+                    _parse_codex_jsonl(output_str.splitlines())
+                    if structured_evidence_trustworthy
+                    else {}
+                )
             else:
                 try:
                     _strict_json_object(output_str)
@@ -10103,7 +10118,13 @@ def _run_with_provider(
                 actual_model,
                 evidence_trustworthy=structured_evidence_trustworthy,
             )
-        except json.JSONDecodeError:
+        except (
+            json.JSONDecodeError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
             # Invalid or incomplete provider output never becomes a public raw
             # snippet; retain only its fail-closed receipt classification.
             receipt = _create_provider_attempt_receipt(
