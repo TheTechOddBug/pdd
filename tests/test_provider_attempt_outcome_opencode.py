@@ -199,6 +199,26 @@ def test_opencode_malformed_known_event_overrides_activity(
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize("wrapped", [False, True], ids=["array", "event"])
+def test_opencode_deeply_nested_json_remains_ambiguous(
+    tmp_path, returncode, wrapped
+):
+    nested = "[" * 900 + "0" + "]" * 900
+    stdout = (
+        '{"type":"text","part":{"type":"text","text":' + nested + "}}"
+        if wrapped
+        else nested
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["opencode"],
+        boundary_result=_completed(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
 def test_opencode_supported_session_end_remains_successful(tmp_path):
     stdout = "\n".join(
         [

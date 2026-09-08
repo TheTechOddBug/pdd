@@ -1729,7 +1729,7 @@ def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
     """Return activity from the canonical OpenCode decode/summary pass."""
     try:
         parsed = _parse_opencode_jsonl(stdout)
-    except (OverflowError, TypeError, ValueError):
+    except (OverflowError, RecursionError, TypeError, ValueError):
         return None
     if not parsed.get("evidence_trustworthy", False):
         return None
@@ -5989,11 +5989,17 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             continue
         try:
             event = _strict_json_object(line)
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except (
+            json.JSONDecodeError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
             evidence_trustworthy = False
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, OverflowError, RecursionError):
                 continue
         if not isinstance(event, dict):
             evidence_trustworthy = False
