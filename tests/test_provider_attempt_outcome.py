@@ -199,6 +199,22 @@ def test_complete_private_envelope_returns_not_started_and_blocks_fallback(tmp_p
     assert '"duration_api_ms"' not in result.output_text
 
 
+def test_single_attempt_unstructured_diagnostic_never_echoes_private_text(tmp_path):
+    private_text = (
+        "authentication failed password=hunter2 "
+        "session_id=sess_sensitive request_id=req_01JPRIVATE"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["anthropic"],
+        boundary_result=_completed("", stderr=private_text),
+    )
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+    assert len(result.output_text) <= 500
+    for private_value in ("hunter2", "sess_sensitive", "req_01JPRIVATE"):
+        assert private_value not in result.output_text
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -226,15 +242,13 @@ def test_complete_private_envelope_returns_not_started_and_blocks_fallback(tmp_p
         "model-usage",
     ],
 )
-def test_reviewed_positive_activity_wins_over_auth_rejection(tmp_path, mutation):
+def test_reviewed_positive_activity_wins_over_auth_rejection(mutation):
     envelope = _zero_work_rejection()
     mutation(envelope)
-    result, _, _ = _run_public(
-        tmp_path,
-        providers=["anthropic"],
-        boundary_result=_completed(json.dumps(envelope)),
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, json.dumps(envelope), ""
     )
-    assert _receipt_dict(result)["work_disposition"] == "started_or_billable"
+    assert receipt.work_disposition == "started_or_billable"
 
 
 @pytest.mark.parametrize(
@@ -255,16 +269,14 @@ def test_reviewed_positive_activity_wins_over_auth_rejection(tmp_path, mutation)
     ],
 )
 def test_missing_required_anthropic_zero_work_field_is_ambiguous(
-    tmp_path, missing_field
+    missing_field
 ):
     envelope = _zero_work_rejection()
     del envelope[missing_field]
-    result, _, _ = _run_public(
-        tmp_path,
-        providers=["anthropic"],
-        boundary_result=_completed(json.dumps(envelope)),
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, json.dumps(envelope), ""
     )
-    assert _receipt_dict(result)["work_disposition"] == "ambiguous"
+    assert receipt.work_disposition == "ambiguous"
 
 
 @pytest.mark.parametrize(
@@ -286,7 +298,7 @@ def test_incomplete_or_unstructured_failure_is_ambiguous(tmp_path, stdout, stder
     assert _receipt_dict(result)["work_disposition"] == "ambiguous"
 
 
-def test_contradictory_and_forged_receipt_fields_are_ambiguous(tmp_path):
+def test_contradictory_and_forged_receipt_fields_are_ambiguous():
     for mutate in (
         lambda data: data.__setitem__("is_error", False),
         lambda data: data.__setitem__(
@@ -296,21 +308,62 @@ def test_contradictory_and_forged_receipt_fields_are_ambiguous(tmp_path):
     ):
         envelope = _zero_work_rejection()
         mutate(envelope)
-        result, _, _ = _run_public(
-            tmp_path,
-            providers=["anthropic"],
-            boundary_result=_completed(json.dumps(envelope)),
+        receipt = ac._create_provider_attempt_receipt(
+            "anthropic", 1, 1, json.dumps(envelope), ""
         )
-        receipt = _receipt_dict(result)
-        assert receipt["work_disposition"] == "ambiguous"
-        assert receipt["provider"] == "anthropic"
-        assert set(receipt) == {
+        receipt_dict = receipt.to_dict()
+        assert receipt.work_disposition == "ambiguous"
+        assert receipt.provider == "anthropic"
+        assert set(receipt_dict) == {
             "schema_version",
             "provider",
             "attempt_number",
             "failure_kind",
             "work_disposition",
         }
+
+
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("request_started",), True),
+        (("usage", "future_billable_units"), 1),
+        (("usage", "server_tool_use", "code_execution_requests"), 1),
+        (("subagent_stats", "scheduled"), 1),
+    ],
+    ids=["top-level", "usage", "tool", "subagent"],
+)
+def test_unknown_activity_fields_make_anthropic_evidence_ambiguous(path, value):
+    envelope = _zero_work_rejection()
+    target = envelope
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, json.dumps(envelope), ""
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
+def test_unknown_schema_with_known_positive_field_is_ambiguous():
+    envelope = _zero_work_rejection()
+    envelope["type"] = "future_result"
+    envelope["usage"]["input_tokens"] = 2
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, json.dumps(envelope), ""
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
+def test_contradictory_stderr_prevents_not_started():
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic",
+        1,
+        1,
+        json.dumps(_zero_work_rejection()),
+        "connection reset after request acceptance",
+    )
+    assert receipt.work_disposition == "ambiguous"
 
 
 def test_explicit_incomplete_capture_and_unknown_provider_fail_closed():
@@ -364,6 +417,56 @@ def test_other_standard_provider_schemas_do_not_borrow_anthropic_proof(
     assert receipt.work_disposition == "ambiguous"
 
 
+def test_google_reviewed_positive_stats_yield_started_or_billable(tmp_path):
+    envelope = {
+        "type": "error",
+        "message": "synthetic failure",
+        "stats": {
+            "models": {
+                "synthetic-model": {"tokens": {"prompt": 1, "candidates": 0}}
+            }
+        },
+    }
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["google"],
+        boundary_result=_completed(json.dumps(envelope)),
+    )
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+def test_google_unknown_positive_field_does_not_claim_started():
+    receipt = ac._create_provider_attempt_receipt(
+        "google",
+        1,
+        1,
+        json.dumps(
+            {
+                "type": "error",
+                "stats": {"models": {"synthetic": {"future_counter": 1}}},
+            }
+        ),
+        "",
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
+def test_opencode_reviewed_text_event_yields_started_or_billable(tmp_path):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "text", "part": {"text": "partial work"}}),
+            json.dumps({"type": "error", "message": "synthetic failure"}),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout),
+        )
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
 def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
     stdout = io.BytesIO(b'{"type":"error","message":"synthetic failure"}\n')
     stderr = io.BytesIO(b"")
@@ -387,6 +490,52 @@ def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
     assert spooled_mock.call_count == 1
     assert result.provider_attempt_receipt.provider == "openai"
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+def test_codex_spooled_positive_usage_yields_started_or_billable(tmp_path):
+    payload = (
+        json.dumps(
+            {
+                "type": "turn.completed",
+                "usage": {"input_tokens": 1, "output_tokens": 0},
+            }
+        )
+        + "\n"
+        + json.dumps({"type": "error", "message": "synthetic failure"})
+        + "\n"
+    ).encode()
+    stdout = io.BytesIO(payload)
+    boundary = ac._SpooledCompletedProcess(
+        args=["codex"],
+        returncode=1,
+        stdout_file=stdout,
+        stderr_file=io.BytesIO(b""),
+        stdout_bytes=len(payload),
+        stderr_bytes=0,
+        stdout_head=payload.decode(),
+        stdout_tail="",
+        stderr_head="",
+        stderr_tail="",
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=boundary,
+    )
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+def test_codex_unknown_positive_usage_field_does_not_claim_started():
+    receipt = ac._create_provider_attempt_receipt(
+        "openai",
+        1,
+        1,
+        json.dumps(
+            {"type": "turn.completed", "usage": {"future_counter": 1}}
+        ),
+        "",
+    )
+    assert receipt.work_disposition == "ambiguous"
 
 
 def test_interactive_pty_failure_attaches_ambiguous_receipt(tmp_path):
@@ -413,6 +562,43 @@ def test_interactive_pty_failure_attaches_ambiguous_receipt(tmp_path):
     assert pty_boundary.call_count == 1
     assert result.provider_attempt_receipt.provider == "anthropic"
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+def test_interactive_pty_positive_usage_yields_started_or_billable(tmp_path):
+    usage = {
+        "claude": [
+            {
+                "model": "synthetic-model",
+                "input_tokens": 1,
+                "output_tokens": 0,
+                "cached_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+            }
+        ]
+    }
+    with patch.dict(
+        "os.environ",
+        {"PDD_CLAUDE_CODE_MODE": "interactive", "PDD_AGENTIC_PROVIDER": "anthropic"},
+        clear=False,
+    ), patch(
+        "pdd.agentic_common.get_available_agents", return_value=["anthropic"]
+    ), patch(
+        "pdd.agentic_common._find_cli_binary", return_value="/synthetic/claude"
+    ), patch(
+        "pdd.agentic_common._strip_anthropic_creds_for_claude_subprocess"
+    ), patch(
+        "pdd.agentic_common._run_claude_interactive_with_mcp",
+        return_value=ac._ProviderRunResult(
+            False, "synthetic PTY failure", 0, None, usage
+        ),
+    ):
+        result = ac.run_agentic_task(
+            "synthetic PTY boundary",
+            tmp_path,
+            quiet=True,
+            single_provider_attempt=True,
+        )
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
 
 
 def test_receipt_none_and_tuple_compatibility_for_success_and_ordinary_run(tmp_path):
