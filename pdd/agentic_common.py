@@ -1396,6 +1396,27 @@ def _nested_value(data: Mapping[str, Any], path: Tuple[str, ...]) -> Any:
     return current
 
 
+def _strict_json_object(text: str) -> Any:
+    """Decode standards-compliant JSON while rejecting duplicate object keys."""
+
+    def _reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = value
+        return result
+
+    return json.loads(
+        text,
+        parse_constant=_reject_constant,
+        object_pairs_hook=_reject_duplicate_keys,
+    )
+
+
 def _mapping_has_only_reviewed_fields(
     data: Mapping[str, Any], path: Tuple[str, ...] = (),
 ) -> bool:
@@ -1433,7 +1454,11 @@ def _anthropic_matches_reviewed_schema(data: Mapping[str, Any]) -> bool:
             return False
     for path in (("duration_ms",),) + _ANTHROPIC_ZERO_NUMBER_PATHS:
         value = _nested_value(data, path)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
             return False
     return (
         isinstance(data.get("modelUsage"), Mapping)
@@ -1444,8 +1469,8 @@ def _anthropic_matches_reviewed_schema(data: Mapping[str, Any]) -> bool:
 
 def _anthropic_cli_version_is_reviewed() -> bool:
     """Accept only the Claude Code version whose failure schema was reviewed."""
-    version = _get_provider_cli_version("anthropic")
-    return re.search(r"(?<!\d)2\.1\.263(?!\d)", version) is not None
+    version = _get_provider_cli_version("anthropic").strip()
+    return re.fullmatch(r"2\.1\.263 \(Claude Code\)", version) is not None
 
 
 def _has_positive_counter(data: Any, names: Set[str]) -> bool:
@@ -1455,8 +1480,18 @@ def _has_positive_counter(data: Any, names: Set[str]) -> bool:
     )
 
 
-def _opencode_jsonl_has_observed_activity(stdout: str) -> bool:
-    """Recognize activity through the existing reviewed OpenCode parser."""
+def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
+    """Recognize activity, returning ``None`` for unreviewed JSONL evidence."""
+    known_types = {"error", "step_start", "step_finish", "text", "tool_use"}
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = _strict_json_object(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(event, Mapping) or event.get("type") not in known_types:
+            return None
     try:
         parsed = _parse_opencode_jsonl(stdout)
     except (OverflowError, TypeError, ValueError):
@@ -1469,15 +1504,32 @@ def _opencode_jsonl_has_observed_activity(stdout: str) -> bool:
     )
 
 
-def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> bool:
-    """Recognize work-bearing events in a complete Codex JSONL stream."""
+def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
+    """Recognize work-bearing events, or ``None`` for unreviewed JSONL."""
+    known_types = {
+        "error",
+        "item.completed",
+        "item.started",
+        "result",
+        "session.end",
+        "session.failed",
+        "session.start",
+        "task.failed",
+        "thread.started",
+        "turn.completed",
+        "turn.failed",
+        "turn.started",
+    }
+    observed_activity = False
     for line in lines:
+        if not line.strip():
+            continue
         try:
-            event = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(event, Mapping):
-            continue
+            event = _strict_json_object(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(event, Mapping) or event.get("type") not in known_types:
+            return None
         event_type = str(event.get("type") or "")
         if event_type not in {
             "result", "item.completed", "session.end", "turn.completed"
@@ -1493,19 +1545,21 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> bool:
                 "cache_write_tokens",
             },
         ):
-            return True
+            observed_activity = True
         item = event.get("item")
         if isinstance(item, Mapping) and item.get("type") in {
             "agent_message", "tool_call", "tool_output"
         }:
             if item.get("text") or item.get("tool") or item.get("tool_calls"):
-                return True
-    return False
+                observed_activity = True
+    return observed_activity
 
 
 def _provider_has_observed_activity(provider: str, data: Mapping[str, Any]) -> bool:
     """Provider-local positive evidence is billable/started, never zero-work."""
     if provider == "google":
+        if data.get("type") not in {"error", "result"}:
+            return False
         stats = data.get("stats")
         models = stats.get("models") if isinstance(stats, Mapping) else None
         if not isinstance(models, Mapping):
@@ -1691,16 +1745,26 @@ def _create_provider_attempt_receipt(
         receipt = _new_provider_attempt_receipt(
             safe_provider, attempt_number, "provider_error", "ambiguous"
         )
+        observed_activity = _opencode_jsonl_has_observed_activity(stdout_text)
+        if observed_activity is None:
+            return receipt
         return _promote_receipt_for_activity(
             receipt,
-            observed_activity=_opencode_jsonl_has_observed_activity(stdout_text),
+            observed_activity=observed_activity,
         )
 
     try:
         if safe_provider == "openai" and "\n" in stdout_text:
+            observed_activity = _codex_jsonl_has_observed_activity(
+                iter(stdout_text.splitlines())
+            )
+            if observed_activity is None:
+                return _new_provider_attempt_receipt(
+                    safe_provider, attempt_number, "unknown", "ambiguous"
+                )
             parsed = _parse_codex_jsonl(stdout_text.splitlines())
         else:
-            parsed = json.loads(stdout_text.strip())
+            parsed = _strict_json_object(stdout_text.strip())
     except (json.JSONDecodeError, TypeError, ValueError):
         combined_text = "\n".join(
             part for part in (stdout_text, stderr_text) if part
@@ -1784,7 +1848,11 @@ def _create_provider_attempt_receipt(
             safe_provider, attempt_number, failure_kind, "ambiguous"
         )
 
-    if _provider_has_observed_activity(safe_provider, parsed):
+    if (
+        safe_provider == "openai"
+        and "\n" in stdout_text
+        and observed_activity
+    ) or _provider_has_observed_activity(safe_provider, parsed):
         return _new_provider_attempt_receipt(
             safe_provider, attempt_number, "provider_error", "started_or_billable"
         )
@@ -9092,7 +9160,7 @@ def _run_with_provider(
                 output_complete=output_complete,
             )
             receipt = _promote_receipt_for_activity(
-                receipt, observed_activity=spooled_activity
+                receipt, observed_activity=spooled_activity is True
             )
             unstructured_detail = private_stderr or private_stdout
             if provider == "openai":

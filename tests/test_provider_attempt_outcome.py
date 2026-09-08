@@ -89,7 +89,8 @@ def _zero_work_rejection() -> dict[str, Any]:
 @pytest.fixture(autouse=True)
 def _reset_provider_state():
     with patch(
-        "pdd.agentic_common._get_provider_cli_version", return_value="2.1.263"
+        "pdd.agentic_common._get_provider_cli_version",
+        return_value="2.1.263 (Claude Code)",
     ):
         ac.reset_disabled_providers()
         yield
@@ -139,7 +140,7 @@ def _run_public(
         stack.enter_context(
             patch(
                 "pdd.agentic_common._get_provider_cli_version",
-                return_value="2.1.263",
+                return_value="2.1.263 (Claude Code)",
             )
         )
         stack.enter_context(
@@ -382,13 +383,36 @@ def test_wrong_reviewed_field_types_are_ambiguous(path, value):
     assert receipt.work_disposition == "ambiguous"
 
 
-def test_unreviewed_anthropic_cli_version_is_ambiguous():
+@pytest.mark.parametrize(
+    "version",
+    ["2.1.264 (Claude Code)", "2.1.263.1", "2.1.263-beta", "2.1.263"],
+)
+def test_unreviewed_anthropic_cli_version_is_ambiguous(version):
     with patch(
-        "pdd.agentic_common._get_provider_cli_version", return_value="2.1.264"
+        "pdd.agentic_common._get_provider_cli_version", return_value=version
     ):
         receipt = ac._create_provider_attempt_receipt(
             "anthropic", 1, 1, json.dumps(_zero_work_rejection()), ""
         )
+    assert receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), float("-inf")])
+def test_nonstandard_anthropic_numbers_are_ambiguous(bad_value):
+    envelope = _zero_work_rejection()
+    envelope["duration_ms"] = bad_value
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, json.dumps(envelope), ""
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
+def test_duplicate_anthropic_json_keys_are_ambiguous():
+    raw = json.dumps(_zero_work_rejection(), separators=(",", ":"))
+    contradictory = '{"usage":{"input_tokens":9},' + raw[1:]
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, contradictory, ""
+    )
     assert receipt.work_disposition == "ambiguous"
 
 
@@ -488,6 +512,24 @@ def test_google_unknown_positive_field_does_not_claim_started():
     assert receipt.work_disposition == "ambiguous"
 
 
+def test_google_unknown_schema_with_known_tokens_is_ambiguous():
+    receipt = ac._create_provider_attempt_receipt(
+        "google",
+        1,
+        1,
+        json.dumps(
+            {
+                "type": "future_result",
+                "stats": {
+                    "models": {"synthetic": {"tokens": {"prompt": 1}}}
+                },
+            }
+        ),
+        "",
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
 def test_opencode_reviewed_text_event_yields_started_or_billable(tmp_path):
     stdout = "\n".join(
         [
@@ -518,6 +560,21 @@ def test_opencode_nonfinite_counter_fails_closed(tmp_path):
             boundary_result=_completed(stdout),
         )
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ['{"type":', json.dumps({"type": "future.event", "cost": 1})],
+    ids=["malformed", "unknown-event"],
+)
+def test_opencode_mixed_unreviewed_jsonl_is_ambiguous(tail):
+    stdout = "\n".join(
+        [json.dumps({"type": "text", "part": {"text": "partial"}}), tail]
+    )
+    receipt = ac._create_provider_attempt_receipt(
+        "opencode", 1, 1, stdout, ""
+    )
+    assert receipt.work_disposition == "ambiguous"
 
 
 def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
@@ -627,6 +684,27 @@ def test_codex_unknown_positive_usage_field_does_not_claim_started():
         ),
         "",
     )
+    assert receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    ['{"type":', json.dumps({"type": "future.event", "usage": {}})],
+    ids=["malformed", "unknown-event"],
+)
+def test_codex_mixed_unreviewed_jsonl_is_ambiguous(tail):
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "turn.completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                }
+            ),
+            tail,
+        ]
+    )
+    receipt = ac._create_provider_attempt_receipt("openai", 1, 1, stdout, "")
     assert receipt.work_disposition == "ambiguous"
 
 
