@@ -88,9 +88,12 @@ def _zero_work_rejection() -> dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def _reset_provider_state():
-    ac.reset_disabled_providers()
-    yield
-    ac.reset_disabled_providers()
+    with patch(
+        "pdd.agentic_common._get_provider_cli_version", return_value="2.1.263"
+    ):
+        ac.reset_disabled_providers()
+        yield
+        ac.reset_disabled_providers()
 
 
 def _completed(stdout: str, *, returncode: int = 1, stderr: str = ""):
@@ -134,7 +137,10 @@ def _run_public(
             patch("pdd.agentic_common._strip_anthropic_creds_for_claude_subprocess")
         )
         stack.enter_context(
-            patch("pdd.agentic_common._get_provider_cli_version", return_value="test")
+            patch(
+                "pdd.agentic_common._get_provider_cli_version",
+                return_value="2.1.263",
+            )
         )
         stack.enter_context(
             patch("pdd.agentic_common._codex_gpt_5_6_version_error", return_value=None)
@@ -355,6 +361,37 @@ def test_unknown_schema_with_known_positive_field_is_ambiguous():
     assert receipt.work_disposition == "ambiguous"
 
 
+@pytest.mark.parametrize(
+    "path,value",
+    [
+        (("usage", "service_tier"), {"future_billable_units": 1}),
+        (("session_id",), {"request_started": True}),
+        (("fast_mode_state",), ["unknown-schema"]),
+    ],
+    ids=["nested-metadata", "session-id", "fast-mode"],
+)
+def test_wrong_reviewed_field_types_are_ambiguous(path, value):
+    envelope = _zero_work_rejection()
+    target = envelope
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+    receipt = ac._create_provider_attempt_receipt(
+        "anthropic", 1, 1, json.dumps(envelope), ""
+    )
+    assert receipt.work_disposition == "ambiguous"
+
+
+def test_unreviewed_anthropic_cli_version_is_ambiguous():
+    with patch(
+        "pdd.agentic_common._get_provider_cli_version", return_value="2.1.264"
+    ):
+        receipt = ac._create_provider_attempt_receipt(
+            "anthropic", 1, 1, json.dumps(_zero_work_rejection()), ""
+        )
+    assert receipt.work_disposition == "ambiguous"
+
+
 def test_contradictory_stderr_prevents_not_started():
     receipt = ac._create_provider_attempt_receipt(
         "anthropic",
@@ -465,6 +502,22 @@ def test_opencode_reviewed_text_event_yields_started_or_billable(tmp_path):
             boundary_result=_completed(stdout),
         )
     assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+def test_opencode_nonfinite_counter_fails_closed(tmp_path):
+    stdout = "\n".join(
+        [
+            '{"type":"step_finish","part":{"usage":{"input":1e309}}}',
+            json.dumps({"type": "error", "message": "synthetic failure"}),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout),
+        )
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
 def test_codex_spooled_failure_attaches_ambiguous_receipt(tmp_path):
@@ -590,7 +643,12 @@ def test_interactive_pty_failure_attaches_ambiguous_receipt(tmp_path):
         "pdd.agentic_common._strip_anthropic_creds_for_claude_subprocess"
     ), patch(
         "pdd.agentic_common._run_claude_interactive_with_mcp",
-        return_value=ac._ProviderRunResult(False, "synthetic PTY failure", 0, None),
+        return_value=ac._ProviderRunResult(
+            False,
+            "synthetic PTY failure request_id=req_PRIVATE session_id=sess_PRIVATE",
+            0,
+            None,
+        ),
     ) as pty_boundary:
         result = ac.run_agentic_task(
             "synthetic PTY boundary",
@@ -601,6 +659,8 @@ def test_interactive_pty_failure_attaches_ambiguous_receipt(tmp_path):
     assert pty_boundary.call_count == 1
     assert result.provider_attempt_receipt.provider == "anthropic"
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+    assert "req_PRIVATE" not in result.output_text
+    assert "sess_PRIVATE" not in result.output_text
 
 
 def test_interactive_pty_positive_usage_yields_started_or_billable(tmp_path):
@@ -715,3 +775,22 @@ def test_false_positive_work_and_provider_environment_fail_closed(tmp_path):
         "trust_prompt",
     )
     assert environment.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+def test_single_attempt_false_positive_diagnostic_does_not_echo_private_ids(tmp_path):
+    envelope = {
+        "type": "result",
+        "result": "request_id=req_PRIVATE session_id=sess_PRIVATE",
+        "total_cost_usd": 0,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+        "modelUsage": {},
+    }
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["anthropic"],
+        boundary_result=_completed(json.dumps(envelope), returncode=0),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+    assert "req_PRIVATE" not in result.output_text
+    assert "sess_PRIVATE" not in result.output_text

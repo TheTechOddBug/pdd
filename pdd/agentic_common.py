@@ -7,6 +7,7 @@ import hashlib
 import importlib.resources
 import io
 import logging
+import math
 import os
 import signal
 import sys
@@ -1352,6 +1353,20 @@ _ANTHROPIC_REVIEWED_OBJECT_FIELDS = {
     ),
     ("subagent_stats", "by_type"): frozenset(),
 }
+_ANTHROPIC_REVIEWED_STRING_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("type",),
+    ("subtype",),
+    ("result",),
+    ("stop_reason",),
+    ("terminal_reason",),
+    ("session_id",),
+    ("uuid",),
+    ("fast_mode_state",),
+    ("fast_mode_disabled_reason",),
+    ("usage", "service_tier"),
+    ("usage", "inference_geo"),
+    ("usage", "speed"),
+)
 
 
 def _provider_attempt_name(provider: str) -> str:
@@ -1364,7 +1379,12 @@ def _is_exact_zero(value: Any) -> bool:
 
 
 def _is_positive_number(value: Any) -> bool:
-    return not isinstance(value, bool) and isinstance(value, (int, float)) and value > 0
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
 
 
 def _nested_value(data: Mapping[str, Any], path: Tuple[str, ...]) -> Any:
@@ -1384,7 +1404,7 @@ def _mapping_has_only_reviewed_fields(
         _ANTHROPIC_REVIEWED_TOP_LEVEL_FIELDS
         if not path else _ANTHROPIC_REVIEWED_OBJECT_FIELDS.get(path)
     )
-    if allowed is None or any(key not in allowed for key in data):
+    if allowed is None or set(data) != set(allowed):
         return False
     for key, value in data.items():
         child_path = path + (key,)
@@ -1396,6 +1416,38 @@ def _mapping_has_only_reviewed_fields(
     return True
 
 
+def _anthropic_matches_reviewed_schema(data: Mapping[str, Any]) -> bool:
+    """Validate the exact Claude Code 2.1.263 result-envelope shape."""
+    if not _mapping_has_only_reviewed_fields(data):
+        return False
+    if not all(
+        isinstance(_nested_value(data, path), str)
+        for path in _ANTHROPIC_REVIEWED_STRING_PATHS
+    ):
+        return False
+    if data.get("is_error") is not True:
+        return False
+    for path in (("api_error_status",), ("num_turns",)):
+        value = _nested_value(data, path)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    for path in (("duration_ms",),) + _ANTHROPIC_ZERO_NUMBER_PATHS:
+        value = _nested_value(data, path)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+    return (
+        isinstance(data.get("modelUsage"), Mapping)
+        and isinstance(data.get("permission_denials"), list)
+        and isinstance(_nested_value(data, ("usage", "iterations")), list)
+    )
+
+
+def _anthropic_cli_version_is_reviewed() -> bool:
+    """Accept only the Claude Code version whose failure schema was reviewed."""
+    version = _get_provider_cli_version("anthropic")
+    return re.search(r"(?<!\d)2\.1\.263(?!\d)", version) is not None
+
+
 def _has_positive_counter(data: Any, names: Set[str]) -> bool:
     """Check only reviewed counter names in a provider-owned mapping."""
     return isinstance(data, Mapping) and any(
@@ -1405,7 +1457,10 @@ def _has_positive_counter(data: Any, names: Set[str]) -> bool:
 
 def _opencode_jsonl_has_observed_activity(stdout: str) -> bool:
     """Recognize activity through the existing reviewed OpenCode parser."""
-    parsed = _parse_opencode_jsonl(stdout)
+    try:
+        parsed = _parse_opencode_jsonl(stdout)
+    except (OverflowError, TypeError, ValueError):
+        return False
     return bool(parsed.get("text")) or _is_positive_number(
         parsed.get("cost")
     ) or _has_positive_counter(
@@ -1566,7 +1621,7 @@ def _anthropic_has_reviewed_activity(data: Mapping[str, Any]) -> bool:
 
 def _anthropic_is_complete_zero_work_rejection(data: Mapping[str, Any]) -> bool:
     """Match the reviewed Claude 2.1.263 pre-inference rejection boundary."""
-    if not _mapping_has_only_reviewed_fields(data):
+    if not _anthropic_matches_reviewed_schema(data):
         return False
     if data.get("type") != "result" or data.get("subtype") != "success":
         return False
@@ -1683,7 +1738,10 @@ def _create_provider_attempt_receipt(
         # A schema mismatch is deliberately checked before known counters.
         # Positive fields in an unreviewed future envelope are not evidence for
         # either old field semantics or zero work.
-        if not _mapping_has_only_reviewed_fields(parsed):
+        if (
+            not _anthropic_cli_version_is_reviewed()
+            or not _anthropic_matches_reviewed_schema(parsed)
+        ):
             return _new_provider_attempt_receipt(
                 safe_provider, attempt_number, "unknown", "ambiguous"
             )
@@ -5242,7 +5300,11 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             ("reasoning_tokens", "reasoning"),
         ):
             v = usage.get(src_key)
-            if isinstance(v, (int, float)):
+            if (
+                not isinstance(v, bool)
+                and isinstance(v, (int, float))
+                and math.isfinite(v)
+            ):
                 tokens[dst_key] += int(v)
         cache = usage.get("cache")
         if isinstance(cache, dict):
@@ -5251,7 +5313,11 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
                 ("write", "cache_write"),
             ):
                 v = cache.get(src_key)
-                if isinstance(v, (int, float)):
+                if (
+                    not isinstance(v, bool)
+                    and isinstance(v, (int, float))
+                    and math.isfinite(v)
+                ):
                     tokens[dst_key] += int(v)
 
     for raw_line in stdout.splitlines():
@@ -5289,7 +5355,11 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             part = event.get("part")
             if isinstance(part, dict):
                 cost_val = part.get("cost")
-                if isinstance(cost_val, (int, float)):
+                if (
+                    not isinstance(cost_val, bool)
+                    and isinstance(cost_val, (int, float))
+                    and math.isfinite(cost_val)
+                ):
                     cost_total += float(cost_val)
                     cost_reported = True
                 _accumulate_tokens(part.get("usage") or part.get("tokens"))
@@ -5308,7 +5378,11 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
 
         # Tolerate top-level cost on unknown events for forward compatibility.
         cost_val = event.get("cost")
-        if isinstance(cost_val, (int, float)):
+        if (
+            not isinstance(cost_val, bool)
+            and isinstance(cost_val, (int, float))
+            and math.isfinite(cost_val)
+        ):
             cost_total += float(cost_val)
             cost_reported = True
 
@@ -6173,7 +6247,6 @@ def run_agentic_task(
                     set_git_work_tree=set_git_work_tree,
                     background_safe=background_safe,
                     attempt_number=attempt,
-                    safe_failure_diagnostics=single_provider_attempt,
                 )
                 environment_reason = getattr(
                     provider_result, "provider_environment_reason", None
@@ -6203,6 +6276,9 @@ def run_agentic_task(
                         ),
                         cost=cost,
                         usage=usage,
+                    )
+                    output = _public_provider_failure_detail(
+                        single_attempt_receipt, None
                     )
                 last_output = output
                 # Keep requested/effective routing separate from provider-observed
@@ -6288,6 +6364,10 @@ def run_agentic_task(
                                 cost=cost,
                                 usage=usage,
                             )
+                            output = _public_provider_failure_detail(
+                                single_attempt_receipt, None
+                            )
+                            last_output = output
                         if not quiet:
                             console.print(f"[yellow]Provider '{provider}' returned false positive (attempt {attempt}/{max_retries})[/yellow]")
                         # Issue #1376: log false-positive provider replies so the
@@ -8589,7 +8669,6 @@ def _run_with_provider(
     set_git_work_tree: bool = True,
     background_safe: bool = False,
     attempt_number: int = 1,
-    safe_failure_diagnostics: bool = False,
 ) -> Union[Tuple[bool, str, float, Optional[str]], _ProviderRunResult]:
     """
     Internal helper to run a specific provider's CLI.
@@ -9042,10 +9121,6 @@ def _run_with_provider(
                         codex_auth_message,
                         max_chars=MAX_ERROR_SNIPPET_LENGTH,
                     )
-                elif safe_failure_diagnostics:
-                    public_codex_error = _public_provider_failure_detail(
-                        receipt, result.returncode
-                    )
                 elif stdout_error:
                     public_codex_error = _sanitize_comment_body(
                         f"Exit code {result.returncode}: {stdout_error}",
@@ -9073,7 +9148,7 @@ def _run_with_provider(
                 _public_provider_failure_detail(
                     receipt,
                     result.returncode,
-                    "" if safe_failure_diagnostics else unstructured_detail,
+                    unstructured_detail,
                 ),
                 0.0,
                 None,
@@ -9119,12 +9194,8 @@ def _run_with_provider(
                 )
                 return _ProviderRunResult(
                     False,
-                    (
-                        _public_provider_failure_detail(receipt, result.returncode)
-                        if safe_failure_diagnostics
-                        else _sanitize_comment_body(
-                            str(err), max_chars=MAX_ERROR_SNIPPET_LENGTH
-                        )
+                    _sanitize_comment_body(
+                        str(err), max_chars=MAX_ERROR_SNIPPET_LENGTH
                     ),
                     cost,
                     actual_model,
@@ -9187,12 +9258,8 @@ def _run_with_provider(
                 )
                 return _ProviderRunResult(
                     False,
-                    (
-                        _public_provider_failure_detail(receipt, result.returncode)
-                        if safe_failure_diagnostics
-                        else _sanitize_comment_body(
-                            text, max_chars=MAX_ERROR_SNIPPET_LENGTH
-                        )
+                    _sanitize_comment_body(
+                        text, max_chars=MAX_ERROR_SNIPPET_LENGTH
                     ),
                     0.0,
                     None,
@@ -9259,11 +9326,7 @@ def _run_with_provider(
                     )
                 elif receipt is not None:
                     provider_detail = data.get("result")
-                    if safe_failure_diagnostics:
-                        public_text = _public_provider_failure_detail(
-                            receipt, result.returncode
-                        )
-                    elif isinstance(provider_detail, str) and provider_detail:
+                    if isinstance(provider_detail, str) and provider_detail:
                         public_text = _sanitize_comment_body(
                             provider_detail, max_chars=MAX_ERROR_SNIPPET_LENGTH
                         )
@@ -9314,11 +9377,7 @@ def _run_with_provider(
                 output_complete=not result_is_spooled,
             )
             invalid_stdout = "" if result_is_spooled else (result.stdout or "")
-            if safe_failure_diagnostics:
-                public_invalid_json = _public_provider_failure_detail(
-                    receipt, getattr(result, "returncode", None)
-                )
-            elif isinstance(invalid_stdout, str) and not invalid_stdout.lstrip().startswith(
+            if isinstance(invalid_stdout, str) and not invalid_stdout.lstrip().startswith(
                 ("{", "[")
             ):
                 public_invalid_json = _sanitize_comment_body(
