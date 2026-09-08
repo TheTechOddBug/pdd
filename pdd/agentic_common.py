@@ -2076,6 +2076,7 @@ class _ProviderRunResult(tuple):
         provider_attempt_receipt: Optional[ProviderAttemptReceipt] = None,
         classification_detail: Optional[str] = None,
         evidence_trustworthy: bool = True,
+        observed_activity: bool = False,
     ) -> "_ProviderRunResult":
         result = tuple.__new__(
             cls,
@@ -2093,6 +2094,7 @@ class _ProviderRunResult(tuple):
         result._provider_attempt_receipt = provider_attempt_receipt
         result._classification_detail = classification_detail
         result._evidence_trustworthy = bool(evidence_trustworthy)
+        result._observed_activity = bool(observed_activity)
         return result
 
     def __iter__(self):
@@ -2127,6 +2129,11 @@ class _ProviderRunResult(tuple):
     def evidence_trustworthy(self) -> bool:
         """Whether complete structured output passed the strict trust parser."""
         return bool(getattr(self, "_evidence_trustworthy", True))
+
+    @property
+    def observed_activity(self) -> bool:
+        """Whether complete structured output contains reviewed work evidence."""
+        return bool(getattr(self, "_observed_activity", False))
 
 
 @dataclass
@@ -6382,6 +6389,9 @@ def run_agentic_task(
                 evidence_trustworthy = bool(
                     getattr(provider_result, "evidence_trustworthy", True)
                 )
+                observed_activity = bool(
+                    getattr(provider_result, "observed_activity", False)
+                )
                 if not math.isfinite(cost) or _contains_nonfinite_number(usage):
                     evidence_trustworthy = False
                 if single_provider_attempt and not evidence_trustworthy:
@@ -6401,6 +6411,7 @@ def run_agentic_task(
                         ),
                         cost=cost,
                         usage=usage,
+                        observed_activity=observed_activity,
                     )
                     output = _public_provider_failure_detail(
                         single_attempt_receipt, None
@@ -6488,6 +6499,7 @@ def run_agentic_task(
                                 ),
                                 cost=cost,
                                 usage=usage,
+                                observed_activity=observed_activity,
                             )
                             output = _public_provider_failure_detail(
                                 single_attempt_receipt, None
@@ -9407,22 +9419,23 @@ def _run_with_provider(
             output_str = "" if result_is_spooled else result.stdout.strip()
             data: Dict[str, Any] = {}
             structured_evidence_trustworthy = True
+            structured_observed_activity = False
 
             if provider == "openai" and result_is_spooled:
-                structured_evidence_trustworthy = (
-                    _codex_jsonl_has_observed_activity(
-                        _iter_spooled_lines(result.stdout_file)
-                    )
-                    is not None
+                codex_observed_activity = _codex_jsonl_has_observed_activity(
+                    _iter_spooled_lines(result.stdout_file)
                 )
+                structured_evidence_trustworthy = codex_observed_activity is not None
+                structured_observed_activity = codex_observed_activity is True
                 data = _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
                 if not data:
                     raise json.JSONDecodeError("No JSON", result.stdout_tail[:200], 0)
             elif provider == "openai" and "\n" in output_str:
-                structured_evidence_trustworthy = (
-                    _codex_jsonl_has_observed_activity(iter(output_str.splitlines()))
-                    is not None
+                codex_observed_activity = _codex_jsonl_has_observed_activity(
+                    iter(output_str.splitlines())
                 )
+                structured_evidence_trustworthy = codex_observed_activity is not None
+                structured_observed_activity = codex_observed_activity is True
                 data = _parse_codex_jsonl(output_str.splitlines())
             else:
                 try:
@@ -9511,6 +9524,7 @@ def _run_with_provider(
                     effective_codex_effort,
                     effective_codex_effort,
                     evidence_trustworthy=structured_evidence_trustworthy,
+                    observed_activity=structured_observed_activity,
                 )
             return _ProviderRunResult(
                 success,

@@ -696,6 +696,44 @@ def test_codex_spooled_positive_usage_yields_started_or_billable(tmp_path):
     assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
 
 
+def test_codex_exit_zero_message_then_failure_preserves_started_receipt(tmp_path):
+    payload = (
+        "\n".join(
+            [
+                json.dumps({"type": "init"}),
+                json.dumps(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "A substantive synthetic answer.",
+                    }
+                ),
+                json.dumps({"type": "turn.failed"}),
+            ]
+        )
+        + "\n"
+    ).encode()
+    boundary = ac._SpooledCompletedProcess(
+        args=["codex"],
+        returncode=0,
+        stdout_file=io.BytesIO(payload),
+        stderr_file=io.BytesIO(b""),
+        stdout_bytes=len(payload),
+        stderr_bytes=0,
+        stdout_head=payload.decode(),
+        stdout_tail="",
+        stderr_head="",
+        stderr_tail="",
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=boundary,
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
 def test_codex_positive_usage_wins_over_simultaneous_auth_text(tmp_path):
     payload = (
         json.dumps(
