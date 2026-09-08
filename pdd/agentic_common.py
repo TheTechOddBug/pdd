@@ -1701,14 +1701,18 @@ def _codex_tool_calls_shape_is_reviewed(value: Any) -> bool:
     for call in value:
         if not isinstance(call, Mapping):
             return False
-        direct_name = call.get("tool") or call.get("name")
-        function = call.get("function")
-        function_name = function.get("name") if isinstance(function, Mapping) else None
-        if not (
-            isinstance(direct_name, str) and direct_name
-        ) and not (
-            isinstance(function_name, str) and function_name
-        ):
+        name_fields = [name for name in ("tool", "name", "function") if name in call]
+        if len(name_fields) != 1:
+            return False
+        name_field = name_fields[0]
+        if name_field == "function":
+            function = call["function"]
+            if not isinstance(function, Mapping):
+                return False
+            name = function.get("name")
+        else:
+            name = call[name_field]
+        if not isinstance(name, str) or not name:
             return False
     return True
 
@@ -1724,24 +1728,25 @@ def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
         if "tool" in item or "tool_calls" in item:
             return None
         if "text" not in item:
-            return False if started else None
+            return True if started else None
         text = item.get("text")
-        return bool(text) if isinstance(text, str) else None
-    if item_type not in {"tool_call", "tool_output"}:
+        if not isinstance(text, str):
+            return None
+        return True if started else bool(text)
+    if item_type == "tool_call":
+        if "text" in item or "tool_calls" in item:
+            return None
+        tool = item.get("tool")
+        return True if isinstance(tool, str) and tool else None
+    if item_type == "tool_output":
+        if "text" in item or "tool" in item:
+            return None
+        return True if _codex_tool_calls_shape_is_reviewed(
+            item.get("tool_calls")
+        ) else None
+    if item_type is None:
         return None
-    present = False
-    for name in ("text", "tool"):
-        if name not in item:
-            continue
-        value = item[name]
-        if not isinstance(value, str):
-            return None
-        present = present or bool(value)
-    if "tool_calls" in item:
-        if not _codex_tool_calls_shape_is_reviewed(item["tool_calls"]):
-            return None
-        present = True
-    return present or (False if started else None)
+    return None
 
 
 def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:

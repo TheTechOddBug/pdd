@@ -1086,8 +1086,36 @@ def test_codex_started_tool_item_claims_started(tmp_path, returncode):
                 "tool_calls": [{"function": {"name": "forged"}}],
             },
         },
+        {
+            "type": "item.completed",
+            "item": {"type": "tool_call", "text": "cross variant"},
+        },
+        {
+            "type": "item.completed",
+            "item": {"type": "tool_output", "tool": "cross-variant"},
+        },
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "tool_output",
+                "tool_calls": [
+                    {
+                        "tool": "synthetic-tool",
+                        "function": {"name": {"forged": "shape"}},
+                    }
+                ],
+            },
+        },
+        {"type": "item.started", "item": {"type": "tool_call"}},
     ],
-    ids=["unknown-started-item", "cross-variant-field"],
+    ids=[
+        "unknown-started-item",
+        "agent-message-cross-field",
+        "tool-call-cross-field",
+        "tool-output-cross-field",
+        "contradictory-call-name",
+        "missing-started-tool",
+    ],
 )
 def test_codex_unreviewed_item_overrides_prior_activity(
     tmp_path, event, returncode
@@ -1115,6 +1143,31 @@ def test_codex_unreviewed_item_overrides_prior_activity(
     )
     assert result.success is False
     assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_codex_started_agent_message_proves_acceptance(tmp_path, returncode):
+    stdout = (
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {"type": "agent_message"},
+                    }
+                ),
+                json.dumps({"type": "turn.failed"}),
+            ]
+        )
+        + "\n"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
 
 
 def test_codex_unknown_positive_usage_field_does_not_claim_started():
