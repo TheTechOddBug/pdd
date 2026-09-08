@@ -185,7 +185,7 @@ def test_cloud_batch_image_installs_every_collection_time_dependency():
     # test_zsh_completion imports pexpect at module collection time. The
     # immutable worker must carry and verify it before any Batch job is
     # published or submitted.
-    assert "'pexpect>=4.9'" in dockerfile_text
+    assert "RUN pip install --no-cache-dir 'pexpect>=4.9'" in dockerfile_text
     assert "import pexpect" in cloudbuild_text
     assert "testmon, pexpect" in entrypoint_text
 

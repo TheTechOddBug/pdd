@@ -41,7 +41,10 @@ RUN git config --system user.email "ci@pdd.dev" && \
 WORKDIR /app
 COPY requirements.txt pyproject.toml ./
 RUN pip install --no-cache-dir -r requirements.txt && \
-    pip install --no-cache-dir pytest-xdist pytest-mock pytest-asyncio pytest-timeout 'pexpect>=4.9' httpx build
+    pip install --no-cache-dir pytest-xdist pytest-mock pytest-asyncio pytest-timeout httpx build
+# Keep collection-only additions in their own layer so the large dependency
+# layer above remains cacheable when a test adds one direct import.
+RUN pip install --no-cache-dir 'pexpect>=4.9'
 
 # Entrypoint script
 COPY ci/cloud-batch/entrypoint.sh /entrypoint.sh
