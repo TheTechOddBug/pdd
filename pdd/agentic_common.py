@@ -1500,51 +1500,55 @@ def _has_positive_counter(data: Any, names: Set[str]) -> bool:
     )
 
 
+_OPENCODE_TOKEN_FIELDS = (
+    ("input", "input"),
+    ("input_tokens", "input"),
+    ("prompt_tokens", "input"),
+    ("output", "output"),
+    ("output_tokens", "output"),
+    ("completion_tokens", "output"),
+    ("reasoning", "reasoning"),
+    ("reasoning_tokens", "reasoning"),
+)
+_OPENCODE_EVENT_TYPES = frozenset(
+    {"error", "session.end", "step_start", "step_finish", "text", "tool_use"}
+)
+
+
+def _opencode_nonnegative_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
 def _opencode_usage_shape_is_reviewed(value: Any) -> bool:
     """Validate only the OpenCode counters used by receipt classification."""
     if not isinstance(value, Mapping):
         return False
-    for name in {
-        "input",
-        "input_tokens",
-        "prompt_tokens",
-        "output",
-        "output_tokens",
-        "completion_tokens",
-        "reasoning",
-        "reasoning_tokens",
-    }:
-        if name not in value:
-            continue
-        counter = value[name]
-        if (
-            isinstance(counter, bool)
-            or not isinstance(counter, (int, float))
-            or not math.isfinite(counter)
-            or counter < 0
-        ):
-            return False
-    if "cache" in value:
-        cache = value["cache"]
-        if not isinstance(cache, Mapping):
-            return False
-        for name in ("read", "write"):
-            if name not in cache:
-                continue
-            counter = cache[name]
-            if (
-                isinstance(counter, bool)
-                or not isinstance(counter, (int, float))
-                or not math.isfinite(counter)
-                or counter < 0
-            ):
-                return False
-    return True
+    if any(
+        name in value and not _opencode_nonnegative_number(value[name])
+        for name, _ in _OPENCODE_TOKEN_FIELDS
+    ):
+        return False
+    cache = value.get("cache")
+    if cache is None:
+        return True
+    return isinstance(cache, Mapping) and all(
+        name not in cache or _opencode_nonnegative_number(cache[name])
+        for name in ("read", "write")
+    )
 
 
 def _opencode_error_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
     """Accept the reviewed legacy and current OpenCode error shapes."""
-    if "message" in event:
+    has_message = "message" in event
+    has_error = "error" in event
+    if has_message == has_error:
+        return False
+    if has_message:
         return isinstance(event["message"], str) and bool(event["message"])
     error = event.get("error")
     if isinstance(error, str):
@@ -1561,113 +1565,177 @@ def _opencode_error_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
     return "message" not in data or isinstance(data.get("message"), str)
 
 
-def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
-    """Recognize activity, returning ``None`` for unreviewed JSONL evidence."""
-    known_types = {
-        "error",
-        "session.end",
-        "step_start",
-        "step_finish",
-        "text",
-        "tool_use",
-    }
-    observed_activity = False
-    for line in stdout.splitlines():
-        if not line.strip():
+def _opencode_nested_models_are_reviewed(
+    event: Mapping[str, Any], event_type: str
+) -> bool:
+    if "model" in event and not isinstance(event.get("model"), str):
+        return False
+    for nested_key in ("session", "part"):
+        if nested_key not in event:
             continue
-        try:
-            event = _strict_json_object(line)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return None
-        if not isinstance(event, Mapping) or event.get("type") not in known_types:
-            return None
-        event_type = event.get("type")
-        if event_type in {"step_start", "tool_use"}:
-            timestamp = event.get("timestamp")
-            session_id = event.get("sessionID")
-            part = event.get("part")
-            if (
-                isinstance(timestamp, bool)
-                or not isinstance(timestamp, (int, float))
-                or not math.isfinite(timestamp)
-                or not isinstance(session_id, str)
-                or not session_id
-                or not isinstance(part, Mapping)
-                or not all(
-                    isinstance(part.get(key), str) and part.get(key)
-                    for key in ("id", "sessionID", "messageID")
-                )
-                or part.get("sessionID") != session_id
-            ):
-                return None
-            if event_type == "step_start":
-                if part.get("type") != "step-start":
-                    return None
-            else:
-                state = part.get("state")
-                if (
-                    part.get("type") != "tool"
-                    or not isinstance(part.get("callID"), str)
-                    or not part.get("callID")
-                    or not isinstance(part.get("tool"), str)
-                    or not part.get("tool")
-                    or not isinstance(state, Mapping)
-                    or state.get("status") not in {"completed", "error"}
-                ):
-                    return None
-            observed_activity = True
-        elif event_type == "text":
-            part = event.get("part")
-            text_values = [event.get("text"), event.get("content")]
-            if isinstance(part, Mapping):
-                if "type" in part and part.get("type") != "text":
-                    return None
-                text_values.append(part.get("text"))
-            present_text = [value for value in text_values if value is not None]
-            if not present_text or not all(
-                isinstance(value, str) for value in present_text
-            ):
-                return None
-        elif event_type == "step_finish":
-            part = event.get("part")
-            if not isinstance(part, Mapping):
-                return None
-            if "type" in part and part.get("type") != "step-finish":
-                return None
-            if "cost" in part:
-                cost = part["cost"]
-                if (
-                    isinstance(cost, bool)
-                    or not isinstance(cost, (int, float))
-                    or not math.isfinite(cost)
-                    or cost < 0
-                ):
-                    return None
-            for container in (part, event):
-                for name in ("usage", "tokens"):
-                    if name in container and not _opencode_usage_shape_is_reviewed(
-                        container[name]
-                    ):
-                        return None
-        elif event_type == "error":
-            if not _opencode_error_shape_is_reviewed(event):
-                return None
-        elif event_type == "session.end":
-            if "model" in event and not isinstance(event.get("model"), str):
-                return None
-            session = event.get("session")
-            if session is not None and not isinstance(session, Mapping):
-                return None
+        nested = event[nested_key]
+        if not isinstance(nested, Mapping):
+            return False
+        if "model" in nested and not isinstance(nested.get("model"), str):
+            return False
+    if event_type == "error" or "message" not in event:
+        return True
+    message = event["message"]
+    return isinstance(message, Mapping) and (
+        "model" not in message or isinstance(message.get("model"), str)
+    )
+
+
+def _opencode_boundary_activity_is_reviewed(
+    event: Mapping[str, Any], event_type: str
+) -> bool:
+    timestamp = event.get("timestamp")
+    session_id = event.get("sessionID")
+    part = event.get("part")
+    if (
+        not _opencode_nonnegative_number(timestamp)
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(part, Mapping)
+        or not all(
+            isinstance(part.get(key), str) and part.get(key)
+            for key in ("id", "sessionID", "messageID")
+        )
+        or part.get("sessionID") != session_id
+    ):
+        return False
+    if event_type == "step_start":
+        return part.get("type") == "step-start"
+    state = part.get("state")
+    return (
+        part.get("type") == "tool"
+        and isinstance(part.get("callID"), str)
+        and bool(part.get("callID"))
+        and isinstance(part.get("tool"), str)
+        and bool(part.get("tool"))
+        and isinstance(state, Mapping)
+        and state.get("status") in {"completed", "error"}
+    )
+
+
+def _opencode_text_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    text_values = [event[key] for key in ("text", "content") if key in event]
+    part = event.get("part")
+    if isinstance(part, Mapping):
+        if "type" in part and part.get("type") != "text":
+            return False
+        if "text" in part:
+            text_values.append(part["text"])
+    return len(text_values) == 1 and isinstance(text_values[0], str)
+
+
+def _opencode_step_finish_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    part = event.get("part")
+    if not isinstance(part, Mapping):
+        return False
+    if "type" in part and part.get("type") != "step-finish":
+        return False
+    if "cost" in part and not _opencode_nonnegative_number(part["cost"]):
+        return False
+    return all(
+        name not in container
+        or _opencode_usage_shape_is_reviewed(container[name])
+        for container in (part, event)
+        for name in ("usage", "tokens")
+    )
+
+
+def _opencode_event_activity(event: Mapping[str, Any]) -> Optional[bool]:
+    """Validate one OpenCode event and return whether it proves activity."""
+    event_type = event.get("type")
+    if event_type not in _OPENCODE_EVENT_TYPES:
+        return None
+    if not _opencode_nested_models_are_reviewed(event, str(event_type)):
+        return None
+    if event_type in {"step_start", "tool_use"}:
+        return True if _opencode_boundary_activity_is_reviewed(
+            event, str(event_type)
+        ) else None
+    if event_type == "text":
+        return False if _opencode_text_shape_is_reviewed(event) else None
+    if event_type == "step_finish":
+        return False if _opencode_step_finish_shape_is_reviewed(event) else None
+    if event_type == "error":
+        return False if _opencode_error_shape_is_reviewed(event) else None
+    if "cost" in event and not _opencode_nonnegative_number(event["cost"]):
+        return None
+    return False
+
+
+def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
+    """Return activity from the canonical OpenCode decode/summary pass."""
     try:
         parsed = _parse_opencode_jsonl(stdout)
     except (OverflowError, TypeError, ValueError):
-        return False
-    return observed_activity or bool(parsed.get("text")) or _is_positive_number(
-        parsed.get("cost")
-    ) or _has_positive_counter(
-        parsed.get("tokens"),
-        {"input", "output", "reasoning", "cache_read", "cache_write"},
+        return None
+    if not parsed.get("evidence_trustworthy", False):
+        return None
+    return bool(parsed.get("observed_activity", False))
+
+
+_CODEX_USAGE_FIELDS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_write_tokens",
+    }
+)
+
+
+def _codex_usage_shape_is_reviewed(value: Any) -> bool:
+    return isinstance(value, Mapping) and set(value).issubset(_CODEX_USAGE_FIELDS) and all(
+        _opencode_nonnegative_number(counter) for counter in value.values()
     )
+
+
+def _codex_tool_calls_shape_is_reviewed(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    for call in value:
+        if not isinstance(call, Mapping):
+            return False
+        direct_name = call.get("tool") or call.get("name")
+        function = call.get("function")
+        function_name = function.get("name") if isinstance(function, Mapping) else None
+        if not (
+            isinstance(direct_name, str) and direct_name
+        ) and not (
+            isinstance(function_name, str) and function_name
+        ):
+            return False
+    return True
+
+
+def _codex_item_activity(item: Any) -> Optional[bool]:
+    """Validate reviewed Codex completed-item shapes and classify activity."""
+    if not isinstance(item, Mapping):
+        return None
+    item_type = item.get("type")
+    if item_type == "agent_message":
+        text = item.get("text")
+        return bool(text) if isinstance(text, str) else None
+    if item_type not in {"tool_call", "tool_output"}:
+        return None
+    present = False
+    for name in ("text", "tool"):
+        if name not in item:
+            continue
+        value = item[name]
+        if not isinstance(value, str):
+            return None
+        present = present or bool(value)
+    if "tool_calls" in item:
+        if not _codex_tool_calls_shape_is_reviewed(item["tool_calls"]):
+            return None
+        present = True
+    return present or None
 
 
 def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
@@ -1699,6 +1767,12 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
         if not isinstance(event, Mapping) or event.get("type") not in known_types:
             return None
         event_type = str(event.get("type") or "")
+        if "model" in event and not isinstance(event.get("model"), str):
+            return None
+        if "usage" in event and not _codex_usage_shape_is_reviewed(
+            event["usage"]
+        ):
+            return None
         if event_type == "message":
             role = event.get("role")
             content = event.get("content")
@@ -1707,8 +1781,21 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             if content:
                 observed_activity = True
             continue
+        if event_type == "item.completed":
+            item_activity = _codex_item_activity(event.get("item"))
+            if item_activity is None:
+                return None
+            observed_activity = observed_activity or item_activity
+            continue
+        if event_type == "item.started":
+            item = event.get("item")
+            if not isinstance(item, Mapping) or not isinstance(
+                item.get("type"), str
+            ):
+                return None
+            continue
         if event_type not in {
-            "result", "item.completed", "session.end", "turn.completed"
+            "result", "session.end", "turn.completed"
         }:
             continue
         if _has_positive_counter(
@@ -1722,12 +1809,6 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             },
         ):
             observed_activity = True
-        item = event.get("item")
-        if isinstance(item, Mapping) and item.get("type") in {
-            "agent_message", "tool_call", "tool_output"
-        }:
-            if item.get("text") or item.get("tool") or item.get("tool_calls"):
-                observed_activity = True
     return observed_activity
 
 
@@ -5522,12 +5603,16 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
       * ``error``: first error message encountered (empty when none)
       * ``tokens``: dict with ``input``, ``output``, ``reasoning``,
         ``cache_read``, ``cache_write`` counters
+      * ``evidence_trustworthy`` / ``observed_activity``: private receipt
+        classification metadata from this same decode pass
     """
     text_parts: List[str] = []
     cost_total: float = 0.0
     cost_reported = False
     model_names: List[str] = []
     error_msg = ""
+    evidence_trustworthy = bool(stdout)
+    observed_activity = False
     tokens = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
 
     if not stdout:
@@ -5538,6 +5623,8 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             "model": "",
             "error": "",
             "tokens": tokens,
+            "evidence_trustworthy": False,
+            "observed_activity": False,
         }
 
     def _add_model(name: Any) -> None:
@@ -5547,16 +5634,7 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
     def _accumulate_tokens(usage: Any) -> None:
         if not isinstance(usage, dict):
             return
-        for src_key, dst_key in (
-            ("input", "input"),
-            ("input_tokens", "input"),
-            ("prompt_tokens", "input"),
-            ("output", "output"),
-            ("output_tokens", "output"),
-            ("completion_tokens", "output"),
-            ("reasoning", "reasoning"),
-            ("reasoning_tokens", "reasoning"),
-        ):
+        for src_key, dst_key in _OPENCODE_TOKEN_FIELDS:
             v = usage.get(src_key)
             if (
                 not isinstance(v, bool)
@@ -5580,16 +5658,26 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
 
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
-        if not line or not line.startswith("{"):
+        if not line:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+            event = _strict_json_object(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            evidence_trustworthy = False
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
         if not isinstance(event, dict):
+            evidence_trustworthy = False
             continue
 
         ev_type = event.get("type", "")
+        event_activity = _opencode_event_activity(event)
+        if event_activity is None:
+            evidence_trustworthy = False
+        elif event_activity:
+            observed_activity = True
 
         # Capture model from any event that carries it.
         _add_model(event.get("model"))
@@ -5645,6 +5733,14 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             cost_reported = True
 
     model_str = "+".join(sorted(model_names)) if len(model_names) > 1 else (model_names[0] if model_names else "")
+    observed_activity = (
+        observed_activity
+        or bool(text_parts)
+        or _is_positive_number(cost_total)
+        or _has_positive_counter(
+            tokens, {"input", "output", "reasoning", "cache_read", "cache_write"}
+        )
+    )
 
     return {
         "text": "".join(text_parts),
@@ -5653,6 +5749,8 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
         "model": model_str,
         "error": error_msg,
         "tokens": tokens,
+        "evidence_trustworthy": evidence_trustworthy,
+        "observed_activity": observed_activity,
     }
 
 
@@ -6536,6 +6634,7 @@ def run_agentic_task(
                 if single_provider_attempt and not evidence_trustworthy:
                     cost = 0.0
                     usage = None
+                    observed_activity = False
                     internal_receipt = _new_provider_attempt_receipt(
                         provider, attempt, "unknown", "ambiguous"
                     )
@@ -9437,11 +9536,11 @@ def _run_with_provider(
         # error...) and routes cost via ``step_finish.part.cost``, so it doesn't
         # belong in the shared single-JSON / Codex-NDJSON path below.
         if provider == "opencode":
-            opencode_observed_activity = _opencode_jsonl_has_observed_activity(
-                result.stdout
-            )
-            opencode_evidence_trustworthy = opencode_observed_activity is not None
             parsed = _parse_opencode_jsonl(result.stdout)
+            opencode_evidence_trustworthy = bool(
+                parsed.get("evidence_trustworthy", False)
+            )
+            opencode_observed_activity = bool(parsed.get("observed_activity", False))
             actual_model = parsed.get("model") or None
             err = parsed.get("error") or ""
             # Cost: prefer JSONL-reported cost; fall back to CSV pricing when

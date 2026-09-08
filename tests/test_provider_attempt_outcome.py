@@ -103,6 +103,22 @@ def _completed(stdout: str, *, returncode: int = 1, stderr: str = ""):
     )
 
 
+def _spooled(stdout: str, *, returncode: int) -> ac._SpooledCompletedProcess:
+    payload = stdout.encode()
+    return ac._SpooledCompletedProcess(
+        args=["codex"],
+        returncode=returncode,
+        stdout_file=io.BytesIO(payload),
+        stderr_file=io.BytesIO(b""),
+        stdout_bytes=len(payload),
+        stderr_bytes=0,
+        stdout_head=stdout,
+        stdout_tail="",
+        stderr_head="",
+        stderr_tail="",
+    )
+
+
 def _opencode_step_start() -> dict[str, Any]:
     return {
         "type": "step_start",
@@ -697,8 +713,23 @@ def test_opencode_unreviewed_activity_shape_is_ambiguous(event):
         {"type": "step_finish", "part": {"cost": "0.01"}},
         {"type": "error", "message": {"forged": "shape"}},
         {"type": "session.end", "model": {"forged": "shape"}},
+        {"type": "text", "part": 17, "text": "OK"},
+        {"type": "session.end", "session": {"model": {"forged": "shape"}}},
+        {
+            "type": "error",
+            "message": "synthetic failure",
+            "error": {"forged": "shape"},
+        },
     ],
-    ids=["text", "step-finish", "error", "session-end"],
+    ids=[
+        "text",
+        "step-finish",
+        "error",
+        "session-end",
+        "scalar-text-part",
+        "nested-session-model",
+        "dual-error",
+    ],
 )
 @pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
 def test_opencode_malformed_known_event_overrides_activity(
@@ -919,6 +950,57 @@ def test_codex_positive_usage_wins_over_simultaneous_auth_text(tmp_path):
     receipt = result.provider_attempt_receipt
     assert receipt.failure_kind == "credential_or_account"
     assert receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "tool_call", "tool": "synthetic-tool"},
+        {
+            "type": "tool_output",
+            "tool_calls": [{"function": {"name": "synthetic-tool"}}],
+        },
+    ],
+    ids=["tool-call", "tool-output"],
+)
+def test_codex_reviewed_tool_item_claims_started(item):
+    stdout = "\n".join(
+        [
+            json.dumps({"type": "item.completed", "item": item}),
+            json.dumps({"type": "turn.failed"}),
+        ]
+    )
+    receipt = ac._create_provider_attempt_receipt("openai", 1, 1, stdout, "")
+    assert receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "agent_message", "text": {"forged": "shape"}},
+        {"type": "tool_call", "tool": {"forged": "shape"}},
+        {"type": "tool_output", "tool_calls": ["not-an-object"]},
+    ],
+    ids=["agent-message-text", "tool-name", "tool-calls"],
+)
+def test_codex_malformed_modern_item_is_ambiguous(tmp_path, item, returncode):
+    stdout = (
+        "\n".join(
+            [
+                json.dumps({"type": "item.completed", "item": item}),
+                json.dumps({"type": "turn.failed"}),
+            ]
+        )
+        + "\n"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
 
 
 def test_codex_unknown_positive_usage_field_does_not_claim_started():
