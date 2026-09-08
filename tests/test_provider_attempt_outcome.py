@@ -795,6 +795,51 @@ def test_opencode_short_text_false_positive_preserves_started_receipt(tmp_path):
     assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
 
 
+def test_opencode_nested_error_overrides_partial_success_without_leak(tmp_path):
+    private_detail = "synthetic private provider detail Bearer sk-not-a-real-secret"
+    stdout = "\n".join(
+        [
+            json.dumps(_opencode_step_start()),
+            json.dumps(
+                {
+                    "type": "text",
+                    "part": {
+                        "text": "A sufficiently long partial synthetic answer."
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "step_finish",
+                    "part": {
+                        "cost": 0.01,
+                        "usage": {"input_tokens": 1, "output_tokens": 1},
+                    },
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "name": "ProviderError",
+                        "data": {"message": private_detail},
+                    },
+                }
+            ),
+        ]
+    )
+    with patch.dict("os.environ", {"OPENCODE_MODEL": "synthetic/model"}, clear=False):
+        result, _, _ = _run_public(
+            tmp_path,
+            providers=["opencode"],
+            boundary_result=_completed(stdout, returncode=0),
+        )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+    assert private_detail not in result.output_text
+    assert "sk-not-a-real-secret" not in result.output_text
+
+
 @pytest.mark.parametrize(
     "event",
     [_opencode_step_start(), _opencode_tool_use()],
@@ -989,6 +1034,75 @@ def test_codex_malformed_modern_item_is_ambiguous(tmp_path, item, returncode):
         "\n".join(
             [
                 json.dumps({"type": "item.completed", "item": item}),
+                json.dumps({"type": "turn.failed"}),
+            ]
+        )
+        + "\n"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "ambiguous"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+def test_codex_started_tool_item_claims_started(tmp_path, returncode):
+    stdout = (
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "item.started",
+                        "item": {"type": "tool_call", "tool": "synthetic-tool"},
+                    }
+                ),
+                json.dumps({"type": "turn.failed"}),
+            ]
+        )
+        + "\n"
+    )
+    result, _, _ = _run_public(
+        tmp_path,
+        providers=["openai"],
+        boundary_result=_spooled(stdout, returncode=returncode),
+    )
+    assert result.success is False
+    assert result.provider_attempt_receipt.work_disposition == "started_or_billable"
+
+
+@pytest.mark.parametrize("returncode", [0, 1], ids=["exit-zero", "nonzero-exit"])
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "item.started", "item": {"type": "future.item"}},
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "synthetic output",
+                "tool_calls": [{"function": {"name": "forged"}}],
+            },
+        },
+    ],
+    ids=["unknown-started-item", "cross-variant-field"],
+)
+def test_codex_unreviewed_item_overrides_prior_activity(
+    tmp_path, event, returncode
+):
+    stdout = (
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": "synthetic progress",
+                    }
+                ),
+                json.dumps(event),
                 json.dumps({"type": "turn.failed"}),
             ]
         )

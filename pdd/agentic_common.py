@@ -1713,12 +1713,18 @@ def _codex_tool_calls_shape_is_reviewed(value: Any) -> bool:
     return True
 
 
-def _codex_item_activity(item: Any) -> Optional[bool]:
+def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
     """Validate reviewed Codex completed-item shapes and classify activity."""
     if not isinstance(item, Mapping):
         return None
+    if "id" in item and not isinstance(item.get("id"), str):
+        return None
     item_type = item.get("type")
     if item_type == "agent_message":
+        if "tool" in item or "tool_calls" in item:
+            return None
+        if "text" not in item:
+            return False if started else None
         text = item.get("text")
         return bool(text) if isinstance(text, str) else None
     if item_type not in {"tool_call", "tool_output"}:
@@ -1735,7 +1741,7 @@ def _codex_item_activity(item: Any) -> Optional[bool]:
         if not _codex_tool_calls_shape_is_reviewed(item["tool_calls"]):
             return None
         present = True
-    return present or None
+    return present or (False if started else None)
 
 
 def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
@@ -1788,11 +1794,10 @@ def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
             observed_activity = observed_activity or item_activity
             continue
         if event_type == "item.started":
-            item = event.get("item")
-            if not isinstance(item, Mapping) or not isinstance(
-                item.get("type"), str
-            ):
+            item_activity = _codex_item_activity(event.get("item"), started=True)
+            if item_activity is None:
                 return None
+            observed_activity = observed_activity or item_activity
             continue
         if event_type not in {
             "result", "session.end", "turn.completed"
@@ -5689,7 +5694,17 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
         if ev_type == "error":
             msg = event.get("message") or event.get("error") or ""
             if isinstance(msg, dict):
-                msg = msg.get("message") or msg.get("error") or ""
+                data = msg.get("data")
+                nested_message = (
+                    data.get("message") if isinstance(data, Mapping) else ""
+                )
+                msg = (
+                    msg.get("message")
+                    or msg.get("error")
+                    or nested_message
+                    or msg.get("name")
+                    or ""
+                )
             if msg and not error_msg:
                 error_msg = str(msg)
             continue
