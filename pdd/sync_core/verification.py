@@ -276,6 +276,17 @@ _STORY_PROMPT_PHASE_B_STATIONARY_PROFILE_BYTES = (
     _STORY_PROMPT_PHASE_B_PROFILE_BYTES[1],
     _STORY_PROMPT_PHASE_B_PROFILE_BYTES[1],
 )
+# Issue #2422 repairs the verification row omitted when the approved
+# agentic-common prompt was merged.  Preserve the prior historical overlays
+# only for this exact profile-byte transition and its stationary state.
+_PROVIDER_ATTEMPT_PROFILE_BYTES = (
+    _STORY_PROMPT_PHASE_B_PROFILE_BYTES[1],
+    "51ff5d1cb23cd635fc8b2cf7401db0cf6b3f36c733d8c1771e3b917156526b39",
+)
+_PROVIDER_ATTEMPT_STATIONARY_PROFILE_BYTES = (
+    _PROVIDER_ATTEMPT_PROFILE_BYTES[1],
+    _PROVIDER_ATTEMPT_PROFILE_BYTES[1],
+)
 _PR2316_STALE_LLM_REISSUE_HISTORY_PROFILE_BYTES = (
     _OPUS_FABLE_COMPOSED_PROFILE_BYTES[1],
     _TEMPERATURE_REGRESSION_PROFILE_BYTES[1],
@@ -790,6 +801,17 @@ _OPUS_FABLE_COMPOSED_REQUIREMENT_TRANSITIONS = (
         "2e6ea7ead7695f61c359af7053e3d29a9a6cf8ab45a4896492cd813eb0ba0aac",
         _OPUS_FABLE_COMPOSED_PROFILE_BYTES[0],
         _OPUS_FABLE_COMPOSED_PROFILE_BYTES[1],
+    ),
+)
+
+_PROVIDER_ATTEMPT_REQUIREMENT_TRANSITIONS = (
+    _exact_bootstrap_requirement_transition(
+        "pdd/prompts/agentic_common_python.prompt",
+        "python",
+        "23b9d4b69d1ae9a46fcd40281a552eeb110a69ae3d6210c21e0e5ad3901b8e40",
+        "2e8f5569da07464e11343b3317a18e01980ad890b39ba7a0cd3bff5084d5d434",
+        _PROVIDER_ATTEMPT_PROFILE_BYTES[0],
+        _PROVIDER_ATTEMPT_PROFILE_BYTES[1],
     ),
 )
 
@@ -3152,8 +3174,23 @@ def _load_requirement_transition_authorizations(
             ),
         }
     )
+    provider_attempt_profile_state = is_pdd_repository and (
+        (policy_digests, profile_digests)
+        in {
+            (
+                _STORY_PROMPT_PHASE_A_STATIONARY_POLICY_BYTES,
+                _PROVIDER_ATTEMPT_PROFILE_BYTES,
+            ),
+            (
+                _STORY_PROMPT_PHASE_A_STATIONARY_POLICY_BYTES,
+                _PROVIDER_ATTEMPT_STATIONARY_PROFILE_BYTES,
+            ),
+        }
+    )
     story_prompt_historical_state = (
-        story_prompt_phase_a_state or story_prompt_phase_b_state
+        story_prompt_phase_a_state
+        or story_prompt_phase_b_state
+        or provider_attempt_profile_state
     )
     generate_reliability_state = is_pdd_repository and (
         (policy_digests, profile_digests)
@@ -3510,6 +3547,18 @@ def _load_requirement_transition_authorizations(
             if (item.prompt_path, item.language_id)
             not in _SYNC_ROLLOUT_REPAIR_STALE_ROTATION_IDENTITIES
         )
+    if provider_attempt_profile_state:
+        provider_attempt_identities = {
+            (item.prompt_path, item.language_id)
+            for item in _PROVIDER_ATTEMPT_REQUIREMENT_TRANSITIONS
+        }
+        candidate = tuple(
+            item
+            for item in candidate
+            if (item.prompt_path, item.language_id)
+            not in provider_attempt_identities
+        ) + _PROVIDER_ATTEMPT_REQUIREMENT_TRANSITIONS
+        authority.update(_PROVIDER_ATTEMPT_REQUIREMENT_TRANSITIONS)
     pr1971_reconciliation = _is_exact_pr1971_pytest_reconciliation(
         manifest, (protected_policy, candidate_policy), policies, candidate
     )
@@ -4067,6 +4116,32 @@ def _authorized_sync_rollout_profile_reconciliation(
     assert base_rotations is not None and head_rotations is not None
     profile_pair = (_sha256(base_profile), _sha256(head_profile))
     rotation_pair = (_sha256(base_rotations), _sha256(head_rotations))
+    provider_attempt_repair = (
+        profile_pair == _PROVIDER_ATTEMPT_PROFILE_BYTES
+        and rotation_pair == _STORY_PROMPT_PHASE_A_STATIONARY_POLICY_BYTES
+    )
+    if provider_attempt_repair:
+        prompt_path = PurePosixPath("pdd/prompts/agentic_common_python.prompt")
+        stale_reason = (
+            f"{manifest.base_ref}: {prompt_path.as_posix()}: profile requirements "
+            "do not match immutable prompt requirements"
+        )
+        unit_id = UnitId(manifest.repository_id, prompt_path, "python")
+        base_prompt = read_git_blob(root, manifest.base_ref, prompt_path)
+        head_prompt = read_git_blob(root, manifest.head_ref, prompt_path)
+        if (
+            stale_reason in base_invalid
+            and unit_id in set(manifest.expected_managed)
+            and unit_id not in base
+            and unit_id in head
+            and base_prompt is not None
+            and head_prompt is not None
+            and _sha256(base_prompt)
+            == _PROVIDER_ATTEMPT_REQUIREMENT_TRANSITIONS[0].bindings.head_prompt_sha256
+            and base_prompt == head_prompt
+        ):
+            return {unit_id: head[unit_id]}, frozenset({stale_reason})
+        return {}, frozenset()
     exact_pr2316_history = (
         _is_exact_pr2316_stale_llm_reissue_history(
             manifest.repository_id,

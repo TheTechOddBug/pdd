@@ -41,6 +41,7 @@ steps:
         import pytest_asyncio
         import pytest_cov
         import testmon
+        import pexpect
 
         missing = [name for name in ("gh",) if shutil.which(name) is None]
         if missing:

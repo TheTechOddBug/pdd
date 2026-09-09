@@ -7,6 +7,7 @@ import hashlib
 import importlib.resources
 import io
 import logging
+import math
 import os
 import signal
 import sys
@@ -26,6 +27,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo
 from typing import (
+    AbstractSet,
     Any,
     Callable,
     Dict,
@@ -66,6 +68,12 @@ ClaudePolicy = Dict[str, Any]
 UsageSource = str
 _HARNESS_CAPABILITIES_CACHE: Optional[Dict[str, Any]] = None
 TaskClass = Literal["single_file", "multi_file", "repo_scale", "high_isolation"]
+ProviderWorkDisposition = Literal[
+    "not_started", "started_or_billable", "ambiguous"
+]
+ProviderFailureKind = Literal[
+    "credential_or_account", "provider_limit", "provider_error", "transport", "unknown"
+]
 _FILESYSTEM_POLICY_KEYS: Tuple[str, str] = ("writableRoots", "readOnlyRoots")
 _PROVIDER_FAILURE_SINK_ENV = "PDD_PROVIDER_FAILURE_SINK"
 _PROVIDER_FAILURE_TOKEN_ENV = "PDD_PROVIDER_FAILURE_TOKEN"
@@ -162,7 +170,11 @@ def _normalize_token_buckets(provider: str, raw_usage: Any) -> Dict[str, int]:
             if not isinstance(row, dict):
                 continue
             for key, value in row.items():
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(value)
+                ):
                     continue
                 summed[key] = summed.get(key, 0) + int(value)
         raw_usage = summed
@@ -173,9 +185,11 @@ def _normalize_token_buckets(provider: str, raw_usage: Any) -> Dict[str, int]:
             if not isinstance(cur, dict):
                 return 0
             cur = cur.get(key)
+        if isinstance(cur, float) and not math.isfinite(cur):
+            return 0
         try:
             return int(cur or 0)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             return 0
 
     provider = provider.lower()
@@ -1241,6 +1255,1231 @@ class TokenMatch:
         return True
 
 
+@dataclass(frozen=True)
+class ProviderAttemptReceipt:
+    """Bounded PDD-owned evidence summary for one failed provider attempt."""
+
+    schema_version: str
+    provider: str
+    attempt_number: int
+    failure_kind: ProviderFailureKind
+    work_disposition: ProviderWorkDisposition
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return the closed, JSON-serializable public receipt shape."""
+        return {
+            "schema_version": self.schema_version,
+            "provider": self.provider,
+            "attempt_number": self.attempt_number,
+            "failure_kind": self.failure_kind,
+            "work_disposition": self.work_disposition,
+        }
+
+
+_PROVIDER_ATTEMPT_SCHEMA_VERSION = "pdd.provider_attempt.v1"
+_PROVIDER_ATTEMPT_PROVIDERS = frozenset(
+    {"anthropic", "google", "openai", "opencode"}
+)
+_ANTHROPIC_CREDENTIAL_ERROR_RE = re.compile(
+    r"\b(?:authenticat(?:e|ion)|unauthori[sz]ed|login|log\s+in|"
+    r"organization\s+does\s+not\s+have\s+access|account\s+access)\b",
+    re.IGNORECASE,
+)
+
+# This is deliberately a *closed* description of the Claude Code 2.1.263
+# result envelope reviewed for the pre-inference 401/403 case.  It is not a
+# permissive parser: a newer CLI can add an activity counter whose zero value
+# we do not understand, so it must fail closed until reviewed.
+_ANTHROPIC_REVIEWED_TOP_LEVEL_FIELDS = frozenset(
+    {
+        "type",
+        "subtype",
+        "is_error",
+        "result",
+        "stop_reason",
+        "terminal_reason",
+        "api_error_status",
+        "num_turns",
+        "total_cost_usd",
+        "duration_ms",
+        "duration_api_ms",
+        "queued_turn_count",
+        "usage",
+        "modelUsage",
+        "permission_denials",
+        "subagent_stats",
+        "session_id",
+        "uuid",
+        "fast_mode_state",
+        "fast_mode_disabled_reason",
+    }
+)
+_ANTHROPIC_REVIEWED_OBJECT_FIELDS = {
+    ("usage",): frozenset(
+        {
+            "input_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "output_tokens",
+            "output_tokens_details",
+            "server_tool_use",
+            "cache_creation",
+            "iterations",
+            "service_tier",
+            "inference_geo",
+            "speed",
+        }
+    ),
+    ("usage", "output_tokens_details"): frozenset({"thinking_tokens"}),
+    ("usage", "server_tool_use"): frozenset(
+        {"web_search_requests", "web_fetch_requests"}
+    ),
+    ("usage", "cache_creation"): frozenset(
+        {"ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"}
+    ),
+    ("subagent_stats",): frozenset(
+        {
+            "spawned",
+            "requested",
+            "started_in_background",
+            "max_depth",
+            "spawned_by_subagents",
+            "completed",
+            "failed",
+            "killed",
+            "refused",
+            "by_type",
+        }
+    ),
+    ("subagent_stats", "requested"): frozenset(
+        {"background", "foreground", "unset"}
+    ),
+    ("subagent_stats", "killed"): frozenset({"parent", "user", "system"}),
+    ("subagent_stats", "refused"): frozenset(
+        {"depth_limit", "concurrency_limit", "budget"}
+    ),
+    ("subagent_stats", "by_type"): frozenset(),
+}
+_ANTHROPIC_REVIEWED_STRING_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("type",),
+    ("subtype",),
+    ("result",),
+    ("stop_reason",),
+    ("terminal_reason",),
+    ("session_id",),
+    ("uuid",),
+    ("fast_mode_state",),
+    ("fast_mode_disabled_reason",),
+    ("usage", "service_tier"),
+    ("usage", "inference_geo"),
+    ("usage", "speed"),
+)
+
+
+def _provider_attempt_name(provider: str) -> str:
+    normalized = str(provider or "").strip().lower()
+    return normalized if normalized in _PROVIDER_ATTEMPT_PROVIDERS else "unknown"
+
+
+def _is_exact_zero(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and value == 0
+
+
+def _is_positive_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
+def _contains_nonfinite_number(value: Any) -> bool:
+    """Return whether nested provider evidence contains NaN or infinity."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Mapping):
+        return any(_contains_nonfinite_number(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_nonfinite_number(item) for item in value)
+    return False
+
+
+def _nested_value(data: Mapping[str, Any], path: Tuple[str, ...]) -> Any:
+    current: Any = data
+    for key in path:
+        if not isinstance(current, Mapping) or key not in current:
+            return None
+        current = current[key]
+    return current
+
+
+def _decode_strict_json(text: str, object_pairs_hook: Any) -> Any:
+    """Decode finite standards-compliant JSON with a caller-owned key policy."""
+
+    def _reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    decoded = json.loads(
+        text,
+        parse_constant=_reject_constant,
+        object_pairs_hook=object_pairs_hook,
+    )
+    if _contains_nonfinite_number(decoded):
+        raise ValueError("non-finite JSON number")
+    return decoded
+
+
+def _strict_json_object(text: str) -> Any:
+    """Decode standards-compliant JSON while rejecting duplicate object keys."""
+
+    def _reject_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+        result: Dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON object key: {key}")
+            result[key] = value
+        return result
+
+    return _decode_strict_json(text, _reject_duplicate_keys)
+
+
+def _strict_codex_json_object(text: str) -> Any:
+    """Decode Codex JSONL, including its reviewed web-search double ID.
+
+    Codex 0.153.2 flattens ``ThreadItem.id`` and ``WebSearchItem.id`` into the
+    same object, so that one provider-owned variant serializes two string
+    ``id`` keys. Every other duplicate remains malformed.
+    """
+
+    class _TrackedObject(dict):
+        duplicate_values: Dict[str, List[Any]]
+
+    def _track_duplicate_keys(pairs: List[Tuple[str, Any]]) -> _TrackedObject:
+        result = _TrackedObject()
+        result.duplicate_values = {}
+        for key, value in pairs:
+            if key in result:
+                values = result.duplicate_values.setdefault(key, [result[key]])
+                values.append(value)
+            result[key] = value
+        return result
+
+    decoded = _decode_strict_json(text, _track_duplicate_keys)
+
+    def _objects(value: Any) -> Iterator[_TrackedObject]:
+        if isinstance(value, _TrackedObject):
+            yield value
+            for nested in value.values():
+                yield from _objects(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                yield from _objects(nested)
+
+    collisions = [item for item in _objects(decoded) if item.duplicate_values]
+    reviewed_item = decoded.get("item") if isinstance(decoded, Mapping) else None
+    reviewed_collision = (
+        len(collisions) == 1
+        and collisions[0] is reviewed_item
+        and decoded.get("type") in ("item.started", "item.updated", "item.completed")
+        and reviewed_item.get("type") == "web_search"
+        and set(reviewed_item.duplicate_values) == {"id"}
+        and len(reviewed_item.duplicate_values["id"]) == 2
+        and all(
+            isinstance(value, str) and value
+            for value in reviewed_item.duplicate_values["id"]
+        )
+    )
+    if collisions and not reviewed_collision:
+        raise ValueError("unreviewed duplicate Codex object key")
+    return decoded
+
+
+def _mapping_has_only_reviewed_fields(
+    data: Mapping[str, Any], path: Tuple[str, ...] = (),
+) -> bool:
+    """Validate every activity-bearing Claude object against the pinned shape."""
+    allowed = (
+        _ANTHROPIC_REVIEWED_TOP_LEVEL_FIELDS
+        if not path else _ANTHROPIC_REVIEWED_OBJECT_FIELDS.get(path)
+    )
+    if allowed is None or set(data) != set(allowed):
+        return False
+    for key, value in data.items():
+        child_path = path + (key,)
+        if child_path in _ANTHROPIC_REVIEWED_OBJECT_FIELDS:
+            if not isinstance(value, Mapping) or not _mapping_has_only_reviewed_fields(
+                value, child_path
+            ):
+                return False
+    return True
+
+
+def _anthropic_matches_reviewed_schema(data: Mapping[str, Any]) -> bool:
+    """Validate the exact Claude Code 2.1.263 result-envelope shape."""
+    if not _mapping_has_only_reviewed_fields(data):
+        return False
+    if not all(
+        isinstance(_nested_value(data, path), str)
+        for path in _ANTHROPIC_REVIEWED_STRING_PATHS
+    ):
+        return False
+    if data.get("is_error") is not True:
+        return False
+    for path in (("api_error_status",), ("num_turns",)):
+        value = _nested_value(data, path)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+    for path in (("duration_ms",),) + _ANTHROPIC_ZERO_NUMBER_PATHS:
+        value = _nested_value(data, path)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            return False
+    return (
+        isinstance(data.get("modelUsage"), Mapping)
+        and isinstance(data.get("permission_denials"), list)
+        and isinstance(_nested_value(data, ("usage", "iterations")), list)
+    )
+
+
+def _anthropic_cli_version_is_reviewed() -> bool:
+    """Accept only the Claude Code version whose failure schema was reviewed."""
+    version = _get_provider_cli_version("anthropic").strip()
+    return re.fullmatch(r"2\.1\.263 \(Claude Code\)", version) is not None
+
+
+def _has_positive_counter(data: Any, names: AbstractSet[str]) -> bool:
+    """Check only reviewed counter names in a provider-owned mapping."""
+    return isinstance(data, Mapping) and any(
+        _is_positive_number(data.get(name)) for name in names
+    )
+
+
+_OPENCODE_TOKEN_FIELDS = (
+    ("input", "input"),
+    ("input_tokens", "input"),
+    ("prompt_tokens", "input"),
+    ("output", "output"),
+    ("output_tokens", "output"),
+    ("completion_tokens", "output"),
+    ("reasoning", "reasoning"),
+    ("reasoning_tokens", "reasoning"),
+)
+_OPENCODE_EVENT_TYPES = frozenset(
+    {"error", "session.end", "step_start", "step_finish", "text", "tool_use"}
+)
+
+
+def _opencode_nonnegative_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+def _opencode_usage_shape_is_reviewed(value: Any) -> bool:
+    """Validate only the OpenCode counters used by receipt classification."""
+    if not isinstance(value, Mapping):
+        return False
+    if any(
+        name in value and not _opencode_nonnegative_number(value[name])
+        for name, _ in _OPENCODE_TOKEN_FIELDS
+    ):
+        return False
+    cache = value.get("cache")
+    if cache is None:
+        return True
+    return isinstance(cache, Mapping) and all(
+        name not in cache or _opencode_nonnegative_number(cache[name])
+        for name in ("read", "write")
+    )
+
+
+def _opencode_error_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    """Accept the reviewed legacy and current OpenCode error shapes."""
+    has_message = "message" in event
+    has_error = "error" in event
+    if has_message == has_error:
+        return False
+    if has_message:
+        return isinstance(event["message"], str) and bool(event["message"])
+    error = event.get("error")
+    if isinstance(error, str):
+        return bool(error)
+    if not isinstance(error, Mapping):
+        return False
+    if not isinstance(error.get("name"), str) or not error.get("name"):
+        return False
+    data = error.get("data")
+    if data is None:
+        return True
+    if not isinstance(data, Mapping):
+        return False
+    return "message" not in data or isinstance(data.get("message"), str)
+
+
+def _opencode_nested_models_are_reviewed(
+    event: Mapping[str, Any], event_type: str
+) -> bool:
+    if "model" in event and not isinstance(event.get("model"), str):
+        return False
+    for nested_key in ("session", "part"):
+        if nested_key not in event:
+            continue
+        nested = event[nested_key]
+        if not isinstance(nested, Mapping):
+            return False
+        if "model" in nested and not isinstance(nested.get("model"), str):
+            return False
+    if event_type == "error" or "message" not in event:
+        return True
+    message = event["message"]
+    return isinstance(message, Mapping) and (
+        "model" not in message or isinstance(message.get("model"), str)
+    )
+
+
+def _opencode_boundary_activity_is_reviewed(
+    event: Mapping[str, Any], event_type: str
+) -> bool:
+    timestamp = event.get("timestamp")
+    session_id = event.get("sessionID")
+    part = event.get("part")
+    if (
+        not _opencode_nonnegative_number(timestamp)
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(part, Mapping)
+        or not all(
+            isinstance(part.get(key), str) and part.get(key)
+            for key in ("id", "sessionID", "messageID")
+        )
+        or part.get("sessionID") != session_id
+    ):
+        return False
+    if event_type == "step_start":
+        return part.get("type") == "step-start"
+    state = part.get("state")
+    return (
+        part.get("type") == "tool"
+        and isinstance(part.get("callID"), str)
+        and bool(part.get("callID"))
+        and isinstance(part.get("tool"), str)
+        and bool(part.get("tool"))
+        and isinstance(state, Mapping)
+        and state.get("status") in ("completed", "error")
+    )
+
+
+def _opencode_text_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    text_values = [event[key] for key in ("text", "content") if key in event]
+    part = event.get("part")
+    if isinstance(part, Mapping):
+        if "type" in part and part.get("type") != "text":
+            return False
+        if "text" in part:
+            text_values.append(part["text"])
+    return len(text_values) == 1 and isinstance(text_values[0], str)
+
+
+def _opencode_step_finish_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    part = event.get("part")
+    if not isinstance(part, Mapping):
+        return False
+    if "type" in part and part.get("type") != "step-finish":
+        return False
+    if "cost" in part and not _opencode_nonnegative_number(part["cost"]):
+        return False
+    return all(
+        name not in container
+        or _opencode_usage_shape_is_reviewed(container[name])
+        for container in (part, event)
+        for name in ("usage", "tokens")
+    )
+
+
+def _opencode_event_activity(event: Mapping[str, Any]) -> Optional[bool]:
+    """Validate one OpenCode event and return whether it proves activity."""
+    event_type = event.get("type")
+    if not isinstance(event_type, str) or event_type not in _OPENCODE_EVENT_TYPES:
+        return None
+    if not _opencode_nested_models_are_reviewed(event, str(event_type)):
+        return None
+    if event_type in {"step_start", "tool_use"}:
+        return True if _opencode_boundary_activity_is_reviewed(
+            event, str(event_type)
+        ) else None
+    if event_type == "text":
+        return False if _opencode_text_shape_is_reviewed(event) else None
+    if event_type == "step_finish":
+        return False if _opencode_step_finish_shape_is_reviewed(event) else None
+    if event_type == "error":
+        return False if _opencode_error_shape_is_reviewed(event) else None
+    if "cost" in event and not _opencode_nonnegative_number(event["cost"]):
+        return None
+    return False
+
+
+def _opencode_jsonl_has_observed_activity(stdout: str) -> Optional[bool]:
+    """Return activity from the canonical OpenCode decode/summary pass."""
+    try:
+        parsed = _parse_opencode_jsonl(stdout)
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        return None
+    if not parsed.get("evidence_trustworthy", False):
+        return None
+    return bool(parsed.get("observed_activity", False))
+
+
+_CODEX_USAGE_FIELDS = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "cached_input_tokens",
+        "cache_creation_input_tokens",
+        "cache_write_tokens",
+        "cache_write_input_tokens",
+        "reasoning_output_tokens",
+    }
+)
+
+
+def _codex_usage_shape_is_reviewed(value: Any) -> bool:
+    return isinstance(value, Mapping) and set(value).issubset(_CODEX_USAGE_FIELDS) and all(
+        _opencode_nonnegative_number(counter) for counter in value.values()
+    )
+
+
+def _codex_tool_calls_shape_is_reviewed(value: Any) -> bool:
+    if not isinstance(value, list) or not value:
+        return False
+    for call in value:
+        if not isinstance(call, Mapping):
+            return False
+        name_fields = [name for name in ("tool", "name", "function") if name in call]
+        if len(name_fields) != 1:
+            return False
+        name_field = name_fields[0]
+        if name_field == "function":
+            function = call["function"]
+            if not isinstance(function, Mapping):
+                return False
+            name = function.get("name")
+        else:
+            name = call[name_field]
+        if not isinstance(name, str) or not name:
+            return False
+    return True
+
+
+def _codex_required_strings(item: Mapping[str, Any], names: Set[str]) -> bool:
+    return all(isinstance(item.get(name), str) and item.get(name) for name in names)
+
+
+def _codex_web_search_action_is_reviewed(value: Any) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    action_type = value.get("type")
+    allowed_fields = {
+        "search": {"type", "query", "queries"},
+        "open_page": {"type", "url"},
+        "find_in_page": {"type", "url", "pattern"},
+        "other": {"type"},
+    }.get(action_type) if isinstance(action_type, str) else None
+    if allowed_fields is None or not set(value).issubset(allowed_fields):
+        return False
+    return all(
+        isinstance(value[name], str)
+        for name in ("query", "url", "pattern")
+        if name in value
+    ) and (
+        "queries" not in value
+        or (
+            isinstance(value["queries"], list)
+            and all(isinstance(query, str) for query in value["queries"])
+        )
+    )
+
+
+def _codex_collab_agents_shape_is_reviewed(value: Any) -> bool:
+    statuses = {
+        "pending_init", "running", "interrupted", "completed", "errored",
+        "shutdown", "not_found",
+    }
+    if not isinstance(value, Mapping):
+        return False
+    return all(
+        isinstance(agent_id, str)
+        and agent_id
+        and isinstance(state, Mapping)
+        and set(state) == {"status", "message"}
+        and state.get("status") in tuple(statuses)
+        and (state.get("message") is None or isinstance(state.get("message"), str))
+        for agent_id, state in value.items()
+    )
+
+
+_CODEX_CURRENT_ITEM_FIELDS = {
+    "agent_message": frozenset({"text"}),
+    "reasoning": frozenset({"text"}),
+    "command_execution": frozenset(
+        {"command", "aggregated_output", "exit_code", "status"}
+    ),
+    "file_change": frozenset({"changes", "status"}),
+    "mcp_tool_call": frozenset(
+        {"server", "tool", "arguments", "result", "error", "status"}
+    ),
+    "collab_tool_call": frozenset(
+        {
+            "tool", "sender_thread_id", "receiver_thread_ids", "prompt",
+            "agents_states", "status",
+        }
+    ),
+    "web_search": frozenset({"query", "action"}),
+    "todo_list": frozenset({"items"}),
+    "error": frozenset({"message"}),
+}
+_CODEX_CLASSIFIER_FIELDS = frozenset().union(*_CODEX_CURRENT_ITEM_FIELDS.values()) | {
+    "tool_calls", "name", "output"
+}
+
+
+def _codex_text_item_activity(
+    item: Mapping[str, Any], started: bool
+) -> Optional[bool]:
+    if not _codex_required_strings(item, {"id", "text"}):
+        return None
+    return True if started else bool(item["text"])
+
+
+def _codex_command_item_activity(
+    item: Mapping[str, Any], _started: bool
+) -> Optional[bool]:
+    if (
+        not _codex_required_strings(item, {"id", "command"})
+        or not isinstance(item.get("aggregated_output"), str)
+    ):
+        return None
+    status = item.get("status")
+    exit_code = item.get("exit_code")
+    if "exit_code" not in item:
+        return None
+    if status in ("in_progress", "declined"):
+        return True if exit_code is None else None
+    if status in ("completed", "failed"):
+        return (
+            None
+            if isinstance(exit_code, bool) or not isinstance(exit_code, int)
+            else True
+        )
+    return None
+
+
+def _codex_file_item_activity(
+    item: Mapping[str, Any], _started: bool
+) -> Optional[bool]:
+    changes = item.get("changes")
+    valid = (
+        _codex_required_strings(item, {"id"})
+        and isinstance(changes, list)
+        and all(
+            isinstance(change, Mapping)
+            and _codex_required_strings(change, {"path"})
+            and change.get("kind") in ("add", "delete", "update")
+            for change in changes
+        )
+        and item.get("status") in ("in_progress", "completed", "failed")
+    )
+    return True if valid else None
+
+
+def _codex_mcp_item_activity(
+    item: Mapping[str, Any], _started: bool
+) -> Optional[bool]:
+    status = item.get("status")
+    if (
+        not _codex_required_strings(item, {"id", "server", "tool"})
+        or "arguments" not in item
+        or status not in ("in_progress", "completed", "failed")
+        or "result" not in item
+        or "error" not in item
+    ):
+        return None
+    result = item.get("result")
+    error = item.get("error")
+    valid_result = result is None or (
+        isinstance(result, Mapping)
+        and isinstance(result.get("content"), list)
+        and "structured_content" in result
+        and set(result).issubset({"content", "_meta", "structured_content"})
+    )
+    valid_error = error is None or (
+        isinstance(error, Mapping) and isinstance(error.get("message"), str)
+    )
+    outcomes = {
+        "in_progress": result is None and error is None,
+        "completed": result is not None and error is None,
+        "failed": result is None and error is not None,
+    }
+    return True if valid_result and valid_error and outcomes[status] else None
+
+
+def _codex_collab_item_activity(
+    item: Mapping[str, Any], _started: bool
+) -> Optional[bool]:
+    receiver_ids = item.get("receiver_thread_ids")
+    valid = (
+        _codex_required_strings(item, {"id", "sender_thread_id"})
+        and item.get("tool") in ("spawn_agent", "send_input", "wait", "close_agent")
+        and isinstance(receiver_ids, list)
+        and all(isinstance(thread_id, str) for thread_id in receiver_ids)
+        and (item.get("prompt") is None or isinstance(item.get("prompt"), str))
+        and _codex_collab_agents_shape_is_reviewed(item.get("agents_states"))
+        and item.get("status") in ("in_progress", "completed", "failed")
+    )
+    return True if valid else None
+
+
+def _codex_web_item_activity(
+    item: Mapping[str, Any], _started: bool
+) -> Optional[bool]:
+    valid = _codex_required_strings(item, {"id", "query"}) and (
+        _codex_web_search_action_is_reviewed(item.get("action"))
+    )
+    return True if valid else None
+
+
+def _codex_todo_item_activity(
+    item: Mapping[str, Any], _started: bool
+) -> Optional[bool]:
+    todos = item.get("items")
+    valid = (
+        _codex_required_strings(item, {"id"})
+        and isinstance(todos, list)
+        and all(
+            isinstance(todo, Mapping)
+            and isinstance(todo.get("text"), str)
+            and isinstance(todo.get("completed"), bool)
+            for todo in todos
+        )
+    )
+    return True if valid else None
+
+
+def _codex_error_item_activity(
+    item: Mapping[str, Any], started: bool
+) -> Optional[bool]:
+    if not _codex_required_strings(item, {"id", "message"}):
+        return None
+    return True if started else False
+
+
+_CODEX_CURRENT_ITEM_VALIDATORS = {
+    "agent_message": _codex_text_item_activity,
+    "reasoning": _codex_text_item_activity,
+    "command_execution": _codex_command_item_activity,
+    "file_change": _codex_file_item_activity,
+    "mcp_tool_call": _codex_mcp_item_activity,
+    "collab_tool_call": _codex_collab_item_activity,
+    "web_search": _codex_web_item_activity,
+    "todo_list": _codex_todo_item_activity,
+    "error": _codex_error_item_activity,
+}
+
+
+def _codex_current_item_activity(
+    item: Mapping[str, Any], *, started: bool
+) -> Optional[bool]:
+    """Dispatch one closed Codex SDK item variant to its small validator."""
+    item_type = str(item.get("type") or "")
+    allowed_fields = _CODEX_CURRENT_ITEM_FIELDS.get(item_type)
+    validator = _CODEX_CURRENT_ITEM_VALIDATORS.get(item_type)
+    if allowed_fields is None or validator is None or any(
+        name in item and name not in allowed_fields
+        for name in _CODEX_CLASSIFIER_FIELDS
+    ):
+        return None
+    return validator(item, started)
+
+
+def _codex_failure_event_shape_is_reviewed(event: Mapping[str, Any]) -> bool:
+    """Validate every provider field used to extract a Codex failure detail."""
+    signal_keys = [
+        key
+        for key in ("error", "message", "detail", "reason", "output", "result")
+        if key in event
+    ]
+    if len(signal_keys) > 1:
+        return False
+    if signal_keys:
+        value = event[signal_keys[0]]
+        if signal_keys[0] == "error" and isinstance(value, Mapping):
+            value = value.get("message")
+        if not isinstance(value, str) or not value:
+            return False
+    return "is_error" not in event or isinstance(event.get("is_error"), bool)
+
+
+def _codex_item_activity(item: Any, *, started: bool = False) -> Optional[bool]:
+    """Validate reviewed Codex completed-item shapes and classify activity."""
+    if not isinstance(item, Mapping):
+        return None
+    if "id" in item and not isinstance(item.get("id"), str):
+        return None
+    item_type = item.get("type")
+    if not isinstance(item_type, str):
+        return None
+    if item_type in {
+        "reasoning",
+        "command_execution",
+        "file_change",
+        "mcp_tool_call",
+        "collab_tool_call",
+        "web_search",
+        "todo_list",
+        "error",
+    } or (item_type == "agent_message" and "id" in item):
+        return _codex_current_item_activity(item, started=started)
+    if item_type == "agent_message":
+        if any(
+            name in item and name != "text" for name in _CODEX_CLASSIFIER_FIELDS
+        ):
+            return None
+        if "text" not in item:
+            return True if started else None
+        text = item.get("text")
+        if not isinstance(text, str):
+            return None
+        return True if started else bool(text)
+    if item_type == "tool_call":
+        present = {name for name in _CODEX_CLASSIFIER_FIELDS if name in item}
+        if present == {"tool"}:
+            tool = item.get("tool")
+            return True if isinstance(tool, str) and tool else None
+        if present != {"name", "output"}:
+            return None
+        return (
+            True
+            if isinstance(item.get("name"), str)
+            and bool(item.get("name"))
+            and isinstance(item.get("output"), str)
+            else None
+        )
+    if item_type == "tool_output":
+        present = {name for name in _CODEX_CLASSIFIER_FIELDS if name in item}
+        if present == {"text"}:
+            return True if isinstance(item.get("text"), str) else None
+        if present != {"tool_calls"}:
+            return None
+        return True if _codex_tool_calls_shape_is_reviewed(
+            item.get("tool_calls")
+        ) else None
+    return None
+
+
+def _scan_codex_jsonl_activity(lines: Iterator[str]) -> Optional[bool]:
+    """Recognize work-bearing events, or ``None`` for unreviewed JSONL."""
+    known_types = {
+        "error",
+        "init",
+        "item.completed",
+        "item.started",
+        "item.updated",
+        "message",
+        "result",
+        "session.end",
+        "session.failed",
+        "session.start",
+        "task.failed",
+        "thread.started",
+        "turn.completed",
+        "turn.failed",
+        "turn.started",
+    }
+    observed_activity = False
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            event = _strict_codex_json_object(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(event, Mapping):
+            return None
+        raw_event_type = event.get("type")
+        if not isinstance(raw_event_type, str) or raw_event_type not in known_types:
+            return None
+        event_type = raw_event_type
+        if event_type in {"error", "turn.failed", "session.failed", "task.failed"}:
+            if not _codex_failure_event_shape_is_reviewed(event):
+                return None
+        if "model" in event and not isinstance(event.get("model"), str):
+            return None
+        if "usage" in event and not _codex_usage_shape_is_reviewed(
+            event["usage"]
+        ):
+            return None
+        if "cost" in event and not _opencode_nonnegative_number(event["cost"]):
+            return None
+        if _has_positive_counter(event.get("usage"), _CODEX_USAGE_FIELDS):
+            observed_activity = True
+        if _is_positive_number(event.get("cost")):
+            observed_activity = True
+        if event_type == "message":
+            role = event.get("role")
+            content = event.get("content")
+            if role != "assistant" or not isinstance(content, str):
+                return None
+            if content:
+                observed_activity = True
+            continue
+        if event_type in {"item.completed", "item.updated"}:
+            item_activity = _codex_item_activity(event.get("item"))
+            if item_activity is None:
+                return None
+            observed_activity = observed_activity or item_activity
+            continue
+        if event_type == "item.started":
+            item_activity = _codex_item_activity(event.get("item"), started=True)
+            if item_activity is None:
+                return None
+            observed_activity = observed_activity or item_activity
+            continue
+        if event_type not in {
+            "result", "session.end", "turn.completed"
+        }:
+            continue
+    return observed_activity
+
+
+def _codex_jsonl_has_observed_activity(lines: Iterator[str]) -> Optional[bool]:
+    """Fail closed if any untrusted Codex value defeats a schema validator."""
+    try:
+        return _scan_codex_jsonl_activity(lines)
+    except (OverflowError, RecursionError, TypeError, ValueError):
+        return None
+
+
+def _provider_has_observed_activity(provider: str, data: Mapping[str, Any]) -> bool:
+    """Provider-local positive evidence is billable/started, never zero-work."""
+    if provider == "google":
+        if data.get("type") not in ("error", "result"):
+            return False
+        stats = data.get("stats")
+        models = stats.get("models") if isinstance(stats, Mapping) else None
+        if not isinstance(models, Mapping):
+            return False
+        return any(
+            isinstance(model_data, Mapping)
+            and _has_positive_counter(
+                model_data.get("tokens"), {"prompt", "candidates", "cached"}
+            )
+            for model_data in models.values()
+        )
+    return False
+
+
+def _promote_receipt_for_activity(
+    receipt: ProviderAttemptReceipt,
+    *,
+    cost: float = 0.0,
+    usage: Any = None,
+    observed_activity: bool = False,
+) -> ProviderAttemptReceipt:
+    """Apply the global positive-work precedence in one bounded factory."""
+    has_usage = any(
+        value > 0
+        for value in _normalize_token_buckets(receipt.provider, usage).values()
+    )
+    if observed_activity or cost > 0 or has_usage:
+        return _new_provider_attempt_receipt(
+            receipt.provider,
+            receipt.attempt_number,
+            receipt.failure_kind,
+            "started_or_billable",
+        )
+    return receipt
+
+
+_ANTHROPIC_ZERO_NUMBER_PATHS: Tuple[Tuple[str, ...], ...] = (
+    ("total_cost_usd",),
+    ("duration_api_ms",),
+    ("queued_turn_count",),
+    ("usage", "input_tokens"),
+    ("usage", "cache_creation_input_tokens"),
+    ("usage", "cache_read_input_tokens"),
+    ("usage", "output_tokens"),
+    ("usage", "output_tokens_details", "thinking_tokens"),
+    ("usage", "server_tool_use", "web_search_requests"),
+    ("usage", "server_tool_use", "web_fetch_requests"),
+    ("usage", "cache_creation", "ephemeral_1h_input_tokens"),
+    ("usage", "cache_creation", "ephemeral_5m_input_tokens"),
+    ("subagent_stats", "spawned"),
+    ("subagent_stats", "requested", "background"),
+    ("subagent_stats", "requested", "foreground"),
+    ("subagent_stats", "requested", "unset"),
+    ("subagent_stats", "started_in_background"),
+    ("subagent_stats", "max_depth"),
+    ("subagent_stats", "spawned_by_subagents"),
+    ("subagent_stats", "completed"),
+    ("subagent_stats", "failed"),
+    ("subagent_stats", "killed", "parent"),
+    ("subagent_stats", "killed", "user"),
+    ("subagent_stats", "killed", "system"),
+    ("subagent_stats", "refused", "depth_limit"),
+    ("subagent_stats", "refused", "concurrency_limit"),
+    ("subagent_stats", "refused", "budget"),
+)
+
+
+def _anthropic_has_reviewed_activity(data: Mapping[str, Any]) -> bool:
+    """Detect only reviewed Claude work fields; wrapper timing is not work."""
+    if any(
+        _is_positive_number(_nested_value(data, path))
+        for path in _ANTHROPIC_ZERO_NUMBER_PATHS
+    ):
+        return True
+    usage = data.get("usage")
+    if isinstance(usage, Mapping):
+        iterations = usage.get("iterations")
+        if isinstance(iterations, list) and iterations:
+            return True
+    model_usage = data.get("modelUsage")
+    if isinstance(model_usage, Mapping) and bool(model_usage):
+        return True
+    permission_denials = data.get("permission_denials")
+    if isinstance(permission_denials, list) and permission_denials:
+        return True
+    by_type = _nested_value(data, ("subagent_stats", "by_type"))
+    return isinstance(by_type, Mapping) and bool(by_type)
+
+
+def _anthropic_is_complete_zero_work_rejection(data: Mapping[str, Any]) -> bool:
+    """Match the reviewed Claude 2.1.263 pre-inference rejection boundary."""
+    if not _anthropic_matches_reviewed_schema(data):
+        return False
+    if data.get("type") != "result" or data.get("subtype") != "success":
+        return False
+    if data.get("stop_reason") != "stop_sequence":
+        return False
+    if data.get("is_error") is not True or data.get("terminal_reason") != "api_error":
+        return False
+    status = data.get("api_error_status")
+    if isinstance(status, bool) or status not in {401, 403}:
+        return False
+    if data.get("num_turns") != 1:
+        return False
+    if not all(
+        _is_exact_zero(_nested_value(data, path))
+        for path in _ANTHROPIC_ZERO_NUMBER_PATHS
+    ):
+        return False
+    if data.get("modelUsage") != {} or data.get("permission_denials") != []:
+        return False
+    if _nested_value(data, ("usage", "iterations")) != []:
+        return False
+    if _nested_value(data, ("subagent_stats", "by_type")) != {}:
+        return False
+    detail = data.get("result")
+    return isinstance(detail, str) and bool(_ANTHROPIC_CREDENTIAL_ERROR_RE.search(detail))
+
+
+def _new_provider_attempt_receipt(
+    provider: str,
+    attempt_number: int,
+    failure_kind: ProviderFailureKind,
+    work_disposition: ProviderWorkDisposition,
+) -> ProviderAttemptReceipt:
+    return ProviderAttemptReceipt(
+        schema_version=_PROVIDER_ATTEMPT_SCHEMA_VERSION,
+        provider=_provider_attempt_name(provider),
+        attempt_number=max(1, int(attempt_number)),
+        failure_kind=failure_kind,
+        work_disposition=work_disposition,
+    )
+
+
+def _create_provider_attempt_receipt(
+    provider: str,
+    attempt_number: int,
+    returncode: int,
+    raw_stdout: str,
+    raw_stderr: str,
+    *,
+    output_complete: bool = True,
+    timed_out: bool = False,
+) -> ProviderAttemptReceipt:
+    """Classify complete private provider evidence into a closed safe receipt."""
+    safe_provider = _provider_attempt_name(provider)
+    stdout_text = raw_stdout if isinstance(raw_stdout, str) else ""
+    stderr_text = raw_stderr if isinstance(raw_stderr, str) else ""
+    if timed_out:
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "transport", "ambiguous"
+        )
+    if safe_provider == "unknown" or not output_complete:
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "unknown", "ambiguous"
+        )
+
+    if safe_provider == "opencode":
+        receipt = _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "provider_error", "ambiguous"
+        )
+        observed_activity = _opencode_jsonl_has_observed_activity(stdout_text)
+        if observed_activity is None:
+            return receipt
+        return _promote_receipt_for_activity(
+            receipt,
+            observed_activity=observed_activity,
+        )
+
+    try:
+        if safe_provider == "openai":
+            observed_activity = _codex_jsonl_has_observed_activity(
+                iter(stdout_text.splitlines())
+            )
+            if observed_activity is None:
+                return _new_provider_attempt_receipt(
+                    safe_provider, attempt_number, "unknown", "ambiguous"
+                )
+            parsed = _parse_codex_jsonl(stdout_text.splitlines())
+        else:
+            parsed = _strict_json_object(stdout_text.strip())
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+        combined_text = "\n".join(
+            part for part in (stdout_text, stderr_text) if part
+        )
+        reset_like = bool(
+            re.search(
+                r"\b(?:connection\s+reset|broken\s+pipe|timed?\s*out)\b",
+                stderr_text,
+                re.I,
+            )
+        )
+        if safe_provider == "anthropic" and _ANTHROPIC_CREDENTIAL_ERROR_RE.search(
+            combined_text
+        ):
+            unstructured_kind: ProviderFailureKind = "credential_or_account"
+        elif re.search(r"\b(?:HTTP\s*)?429\b", combined_text, re.I):
+            unstructured_kind = "provider_limit"
+        elif reset_like:
+            unstructured_kind = "transport"
+        else:
+            unstructured_kind = "unknown"
+        return _new_provider_attempt_receipt(
+            safe_provider,
+            attempt_number,
+            unstructured_kind,
+            "ambiguous",
+        )
+
+    if not isinstance(parsed, dict):
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "unknown", "ambiguous"
+        )
+
+    if safe_provider == "anthropic":
+        # A schema mismatch is deliberately checked before known counters.
+        # Positive fields in an unreviewed future envelope are not evidence for
+        # either old field semantics or zero work.
+        if (
+            not _anthropic_cli_version_is_reviewed()
+            or not _anthropic_matches_reviewed_schema(parsed)
+        ):
+            return _new_provider_attempt_receipt(
+                safe_provider, attempt_number, "unknown", "ambiguous"
+            )
+        if parsed.get("type") != "result" or parsed.get("subtype") != "success":
+            return _new_provider_attempt_receipt(
+                safe_provider, attempt_number, "unknown", "ambiguous"
+            )
+        if _anthropic_has_reviewed_activity(parsed):
+            return _new_provider_attempt_receipt(
+                safe_provider, attempt_number, "provider_error", "started_or_billable"
+            )
+        status = parsed.get("api_error_status")
+        detail = parsed.get("result")
+        credential_failure = (
+            parsed.get("type") == "result"
+            and parsed.get("is_error") is True
+            and not isinstance(status, bool)
+            and status in {401, 403}
+            and isinstance(detail, str)
+            and bool(_ANTHROPIC_CREDENTIAL_ERROR_RE.search(detail))
+        )
+        # A non-empty stderr can be a contradictory second stream (including a
+        # reset after work began). Only an empty benign stderr proves zero work.
+        if (
+            not stderr_text.strip()
+            and _anthropic_is_complete_zero_work_rejection(parsed)
+        ):
+            return _new_provider_attempt_receipt(
+                safe_provider, attempt_number, "credential_or_account", "not_started"
+            )
+        if status == 429:
+            failure_kind: ProviderFailureKind = "provider_limit"
+        elif credential_failure:
+            failure_kind = "credential_or_account"
+        elif parsed.get("is_error") is True:
+            failure_kind = "provider_error"
+        else:
+            failure_kind = "unknown"
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, failure_kind, "ambiguous"
+        )
+
+    if (
+        safe_provider == "openai" and observed_activity
+    ) or _provider_has_observed_activity(safe_provider, parsed):
+        return _new_provider_attempt_receipt(
+            safe_provider, attempt_number, "provider_error", "started_or_billable"
+        )
+
+    # No conclusive-zero schema has been reviewed for these providers. Their
+    # structured failures therefore fail closed instead of borrowing Claude's
+    # field meanings.
+    return _new_provider_attempt_receipt(
+        safe_provider,
+        attempt_number,
+        "provider_error" if returncode != 0 else "unknown",
+        "ambiguous",
+    )
+
+
+def _public_provider_failure_detail(
+    receipt: ProviderAttemptReceipt,
+    returncode: Optional[int],
+    unstructured_detail: str = "",
+) -> str:
+    """Create a PDD-owned diagnostic without copying private provider bytes."""
+    if unstructured_detail and not unstructured_detail.lstrip().startswith(("{", "[")):
+        exit_detail = f"Exit code {returncode}: " if returncode is not None else ""
+        return _sanitize_comment_body(
+            f"{exit_detail}{unstructured_detail}",
+            max_chars=MAX_ERROR_SNIPPET_LENGTH,
+        )
+    if receipt.failure_kind == "credential_or_account":
+        reason = "Authentication failed or account access was denied (auth)"
+    elif receipt.failure_kind == "provider_limit":
+        reason = "provider limit (HTTP 429)"
+    elif receipt.failure_kind == "transport":
+        reason = "provider transport failure"
+    elif receipt.failure_kind == "provider_error":
+        reason = "structured provider failure"
+    else:
+        reason = "Invalid JSON output or unclassified provider failure"
+    exit_detail = f" with exit code {returncode}" if returncode is not None else ""
+    return _sanitize_comment_body(
+        f"Provider {receipt.provider}{exit_detail}: {reason}.", max_chars=500
+    )
+
+
 class AgenticTaskResult(tuple):
     """Public result for ``run_agentic_task`` with legacy four-item unpacking.
 
@@ -1267,6 +2506,7 @@ class AgenticTaskResult(tuple):
         model_id: Optional[str] = None,
         cumulative_cost_usd: Optional[float] = None,
         provider_environment_failure: Optional[Tuple[str, str]] = None,
+        provider_attempt_receipt: Optional[ProviderAttemptReceipt] = None,
     ) -> "AgenticTaskResult":
         result = tuple.__new__(
             cls,
@@ -1279,6 +2519,7 @@ class AgenticTaskResult(tuple):
         result._model_id = model_id
         result._cumulative_cost_usd = cost_usd if cumulative_cost_usd is None else cumulative_cost_usd
         result._provider_environment_failure = provider_environment_failure
+        result._provider_attempt_receipt = provider_attempt_receipt
         return result
 
     def __iter__(self):
@@ -1333,6 +2574,11 @@ class AgenticTaskResult(tuple):
         """Trusted in-process provider/runtime classification, when present."""
         return getattr(self, "_provider_environment_failure", None)
 
+    @property
+    def provider_attempt_receipt(self) -> Optional[ProviderAttemptReceipt]:
+        """Trusted bounded disposition for a failed single provider attempt."""
+        return getattr(self, "_provider_attempt_receipt", None)
+
     def meets_usage_contract(self) -> bool:
         """True when this result has comparable cost/usage for E[pass]-λ·cost routing."""
         return _meets_usage_contract(self)
@@ -1353,6 +2599,11 @@ class AgenticTaskResult(tuple):
             "cumulative_cost_usd": self.cumulative_cost_usd,
             "usage_comparable": self.meets_usage_contract(),
             "token_buckets": _normalize_token_buckets(self.provider, self.usage),
+            "provider_attempt_receipt": (
+                self.provider_attempt_receipt.to_dict()
+                if self.provider_attempt_receipt is not None
+                else None
+            ),
         }
 
 
@@ -1369,6 +2620,10 @@ class _ProviderRunResult(tuple):
         requested_effort: Optional[str] = None,
         effective_effort: Optional[str] = None,
         provider_environment_reason: Optional[str] = None,
+        provider_attempt_receipt: Optional[ProviderAttemptReceipt] = None,
+        classification_detail: Optional[str] = None,
+        evidence_trustworthy: bool = True,
+        observed_activity: bool = False,
     ) -> "_ProviderRunResult":
         result = tuple.__new__(
             cls,
@@ -1383,6 +2638,10 @@ class _ProviderRunResult(tuple):
             ),
         )
         result._provider_environment_reason = provider_environment_reason
+        result._provider_attempt_receipt = provider_attempt_receipt
+        result._classification_detail = classification_detail
+        result._evidence_trustworthy = bool(evidence_trustworthy)
+        result._observed_activity = bool(observed_activity)
         return result
 
     def __iter__(self):
@@ -1403,6 +2662,25 @@ class _ProviderRunResult(tuple):
     @property
     def provider_environment_reason(self) -> Optional[str]:
         return getattr(self, "_provider_environment_reason", None)
+
+    @property
+    def provider_attempt_receipt(self) -> Optional[ProviderAttemptReceipt]:
+        return getattr(self, "_provider_attempt_receipt", None)
+
+    @property
+    def classification_detail(self) -> Optional[str]:
+        """Private provider signal retained when the public detail is bounded."""
+        return getattr(self, "_classification_detail", None)
+
+    @property
+    def evidence_trustworthy(self) -> bool:
+        """Whether complete structured output passed the strict trust parser."""
+        return bool(getattr(self, "_evidence_trustworthy", True))
+
+    @property
+    def observed_activity(self) -> bool:
+        """Whether complete structured output contains reviewed work evidence."""
+        return bool(getattr(self, "_observed_activity", False))
 
 
 @dataclass
@@ -4652,12 +5930,16 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
       * ``error``: first error message encountered (empty when none)
       * ``tokens``: dict with ``input``, ``output``, ``reasoning``,
         ``cache_read``, ``cache_write`` counters
+      * ``evidence_trustworthy`` / ``observed_activity``: private receipt
+        classification metadata from this same decode pass
     """
     text_parts: List[str] = []
     cost_total: float = 0.0
     cost_reported = False
     model_names: List[str] = []
     error_msg = ""
+    evidence_trustworthy = bool(stdout)
+    observed_activity = False
     tokens = {"input": 0, "output": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
 
     if not stdout:
@@ -4668,6 +5950,8 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             "model": "",
             "error": "",
             "tokens": tokens,
+            "evidence_trustworthy": False,
+            "observed_activity": False,
         }
 
     def _add_model(name: Any) -> None:
@@ -4677,18 +5961,13 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
     def _accumulate_tokens(usage: Any) -> None:
         if not isinstance(usage, dict):
             return
-        for src_key, dst_key in (
-            ("input", "input"),
-            ("input_tokens", "input"),
-            ("prompt_tokens", "input"),
-            ("output", "output"),
-            ("output_tokens", "output"),
-            ("completion_tokens", "output"),
-            ("reasoning", "reasoning"),
-            ("reasoning_tokens", "reasoning"),
-        ):
+        for src_key, dst_key in _OPENCODE_TOKEN_FIELDS:
             v = usage.get(src_key)
-            if isinstance(v, (int, float)):
+            if (
+                not isinstance(v, bool)
+                and isinstance(v, (int, float))
+                and math.isfinite(v)
+            ):
                 tokens[dst_key] += int(v)
         cache = usage.get("cache")
         if isinstance(cache, dict):
@@ -4697,21 +5976,41 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
                 ("write", "cache_write"),
             ):
                 v = cache.get(src_key)
-                if isinstance(v, (int, float)):
+                if (
+                    not isinstance(v, bool)
+                    and isinstance(v, (int, float))
+                    and math.isfinite(v)
+                ):
                     tokens[dst_key] += int(v)
 
     for raw_line in stdout.splitlines():
         line = raw_line.strip()
-        if not line or not line.startswith("{"):
+        if not line:
             continue
         try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+            event = _strict_json_object(line)
+        except (
+            json.JSONDecodeError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            evidence_trustworthy = False
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, OverflowError, RecursionError):
+                continue
         if not isinstance(event, dict):
+            evidence_trustworthy = False
             continue
 
         ev_type = event.get("type", "")
+        event_activity = _opencode_event_activity(event)
+        if event_activity is None:
+            evidence_trustworthy = False
+        elif event_activity:
+            observed_activity = True
 
         # Capture model from any event that carries it.
         _add_model(event.get("model"))
@@ -4723,7 +6022,17 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
         if ev_type == "error":
             msg = event.get("message") or event.get("error") or ""
             if isinstance(msg, dict):
-                msg = msg.get("message") or msg.get("error") or ""
+                data = msg.get("data")
+                nested_message = (
+                    data.get("message") if isinstance(data, Mapping) else ""
+                )
+                msg = (
+                    msg.get("message")
+                    or msg.get("error")
+                    or nested_message
+                    or msg.get("name")
+                    or ""
+                )
             if msg and not error_msg:
                 error_msg = str(msg)
             continue
@@ -4735,7 +6044,11 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
             part = event.get("part")
             if isinstance(part, dict):
                 cost_val = part.get("cost")
-                if isinstance(cost_val, (int, float)):
+                if (
+                    not isinstance(cost_val, bool)
+                    and isinstance(cost_val, (int, float))
+                    and math.isfinite(cost_val)
+                ):
                     cost_total += float(cost_val)
                     cost_reported = True
                 _accumulate_tokens(part.get("usage") or part.get("tokens"))
@@ -4754,11 +6067,23 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
 
         # Tolerate top-level cost on unknown events for forward compatibility.
         cost_val = event.get("cost")
-        if isinstance(cost_val, (int, float)):
+        if (
+            not isinstance(cost_val, bool)
+            and isinstance(cost_val, (int, float))
+            and math.isfinite(cost_val)
+        ):
             cost_total += float(cost_val)
             cost_reported = True
 
     model_str = "+".join(sorted(model_names)) if len(model_names) > 1 else (model_names[0] if model_names else "")
+    observed_activity = (
+        observed_activity
+        or bool(text_parts)
+        or _is_positive_number(cost_total)
+        or _has_positive_counter(
+            tokens, {"input", "output", "reasoning", "cache_read", "cache_write"}
+        )
+    )
 
     return {
         "text": "".join(text_parts),
@@ -4767,6 +6092,8 @@ def _parse_opencode_jsonl(stdout: str) -> Dict[str, Any]:
         "model": model_str,
         "error": error_msg,
         "tokens": tokens,
+        "evidence_trustworthy": evidence_trustworthy,
+        "observed_activity": observed_activity,
     }
 
 
@@ -5548,6 +6875,7 @@ def run_agentic_task(
         provider_environment_failure: Optional[Tuple[str, str]] = None
         harness_capabilities = _load_harness_capabilities()
         total_cost = 0.0
+        single_attempt_receipt: Optional[ProviderAttemptReceipt] = None
 
         for provider in candidates:
             if verbose:
@@ -5574,6 +6902,7 @@ def run_agentic_task(
             # (used by both inside-loop logs and the bottom failure log).
             actual_model: Optional[str] = None
             effective_model: Optional[str] = _get_provider_model(provider)
+            classification_detail = ""
             for attempt in range(1, max_retries + 1):
                 # Deadline-aware budget check before each attempt
                 now = time.time()
@@ -5616,6 +6945,7 @@ def run_agentic_task(
                     stall_timeout=stall_timeout,
                     set_git_work_tree=set_git_work_tree,
                     background_safe=background_safe,
+                    attempt_number=attempt,
                 )
                 environment_reason = getattr(
                     provider_result, "provider_environment_reason", None
@@ -5628,10 +6958,45 @@ def run_agentic_task(
                 success = bool(provider_result[0])
                 output = str(provider_result[1])
                 cost = float(provider_result[2])
-                cumulative_cost_usd += cost
-                total_cost += cost
                 actual_model = provider_result[3]
                 usage = provider_result[4] if len(provider_result) > 4 else None
+                internal_receipt = getattr(
+                    provider_result, "provider_attempt_receipt", None
+                )
+                classification_detail = getattr(
+                    provider_result, "classification_detail", None
+                ) or output
+                evidence_trustworthy = bool(
+                    getattr(provider_result, "evidence_trustworthy", True)
+                )
+                observed_activity = bool(
+                    getattr(provider_result, "observed_activity", False)
+                )
+                if not math.isfinite(cost) or _contains_nonfinite_number(usage):
+                    evidence_trustworthy = False
+                if single_provider_attempt and not evidence_trustworthy:
+                    cost = 0.0
+                    usage = None
+                    observed_activity = False
+                    internal_receipt = _new_provider_attempt_receipt(
+                        provider, attempt, "unknown", "ambiguous"
+                    )
+                    if success:
+                        success = False
+                cumulative_cost_usd += cost
+                total_cost += cost
+                if single_provider_attempt and not success:
+                    single_attempt_receipt = _promote_receipt_for_activity(
+                        internal_receipt or _new_provider_attempt_receipt(
+                            provider, attempt, "unknown", "ambiguous"
+                        ),
+                        cost=cost,
+                        usage=usage,
+                        observed_activity=observed_activity,
+                    )
+                    output = _public_provider_failure_detail(
+                        single_attempt_receipt, None
+                    )
                 last_output = output
                 # Keep requested/effective routing separate from provider-observed
                 # provenance. A successful result's model_id must never be filled
@@ -5708,6 +7073,19 @@ def run_agentic_task(
                     )
 
                     if is_false_positive:
+                        if single_provider_attempt:
+                            single_attempt_receipt = _promote_receipt_for_activity(
+                                _new_provider_attempt_receipt(
+                                    provider, attempt, "provider_error", "ambiguous"
+                                ),
+                                cost=cost,
+                                usage=usage,
+                                observed_activity=observed_activity,
+                            )
+                            output = _public_provider_failure_detail(
+                                single_attempt_receipt, None
+                            )
+                            last_output = output
                         if not quiet:
                             console.print(f"[yellow]Provider '{provider}' returned false positive (attempt {attempt}/{max_retries})[/yellow]")
                         # Issue #1376: log false-positive provider replies so the
@@ -5889,7 +7267,7 @@ def run_agentic_task(
                     any_attempt_logged_inside = True
 
                 permanent_class = (
-                    _classify_permanent_error(output) if not success else None
+                    _classify_permanent_error(classification_detail) if not success else None
                 )
                 if permanent_class is not None:
                     # Issue #1936: remember this provider as permanently dead for
@@ -5930,7 +7308,7 @@ def run_agentic_task(
                     # If the previous attempt was rate-limited, raise the
                     # floor so we wait long enough for the limit to clear
                     # instead of burning the next attempt on the same 429.
-                    if _is_rate_limited(last_output or ""):
+                    if _is_rate_limited(classification_detail or ""):
                         backoff = max(backoff, RATE_LIMIT_BACKOFF_FLOOR)
                         if verbose:
                             console.print(
@@ -5954,7 +7332,7 @@ def run_agentic_task(
             # auth/quota/etc. produce none. Deliberately NOT quiet-gated: the
             # cloud scheduler needs the marker even when human diagnostics are
             # suppressed.
-            _emit_provider_limit_marker(provider, last_output)
+            _emit_provider_limit_marker(provider, classification_detail)
             if verbose:
                 console.print(f"[yellow]Provider {provider} failed after {max_retries} attempts: {last_output}[/yellow]")
             # Issue #1072 / #1376 (codex round 2): inline per-attempt logging
@@ -5988,6 +7366,8 @@ def run_agentic_task(
             failure_output = _provider_environment_marker(*provider_environment_failure)
         else:
             failure_output = f"All agent providers failed: {'; '.join(provider_errors)}"
+        if single_provider_attempt:
+            failure_output = _sanitize_comment_body(failure_output, max_chars=500)
         failure_result = AgenticTaskResult(
             False,
             failure_output,
@@ -5996,6 +7376,9 @@ def run_agentic_task(
             None,
             cumulative_cost_usd=cumulative_cost_usd,
             provider_environment_failure=provider_environment_failure,
+            provider_attempt_receipt=(
+                single_attempt_receipt if single_provider_attempt else None
+            ),
         )
 
         _emit_routing_outcome(
@@ -8003,6 +9386,7 @@ def _run_with_provider(
     codex_skip_git_repo_check: bool = False,
     set_git_work_tree: bool = True,
     background_safe: bool = False,
+    attempt_number: int = 1,
 ) -> Union[Tuple[bool, str, float, Optional[str]], _ProviderRunResult]:
     """
     Internal helper to run a specific provider's CLI.
@@ -8358,9 +9742,27 @@ def _run_with_provider(
     try:
         result = runner(cmd, **runner_kwargs)
     except subprocess.TimeoutExpired:
-        return False, "Timeout expired", 0.0, None
-    except Exception as e:
-        return False, str(e), 0.0, None
+        receipt = _create_provider_attempt_receipt(
+            provider, attempt_number, 1, "", "", output_complete=False, timed_out=True
+        )
+        return _ProviderRunResult(
+            False,
+            _public_provider_failure_detail(receipt, None),
+            0.0,
+            None,
+            provider_attempt_receipt=receipt,
+        )
+    except Exception:
+        receipt = _new_provider_attempt_receipt(
+            provider, attempt_number, "transport", "ambiguous"
+        )
+        return _ProviderRunResult(
+            False,
+            _public_provider_failure_detail(receipt, None),
+            0.0,
+            None,
+            provider_attempt_receipt=receipt,
+        )
 
     result_is_spooled = isinstance(result, _SpooledCompletedProcess)
     try:
@@ -8378,8 +9780,39 @@ def _run_with_provider(
                 0.0,
                 None,
                 provider_environment_reason=provider_environment_reason,
+                provider_attempt_receipt=_new_provider_attempt_receipt(
+                    provider, attempt_number, "unknown", "ambiguous"
+                ),
             )
         if result.returncode != 0:
+            if result_is_spooled:
+                private_stdout = ""
+                private_stderr = ""
+                output_complete = False
+                spooled_activity = _codex_jsonl_has_observed_activity(
+                    _iter_spooled_lines(result.stdout_file)
+                )
+            else:
+                private_stdout = (
+                    result.stdout if isinstance(result.stdout, str) else ""
+                )
+                private_stderr = (
+                    result.stderr if isinstance(result.stderr, str) else ""
+                )
+                output_complete = True
+                spooled_activity = False
+            receipt = _create_provider_attempt_receipt(
+                provider,
+                attempt_number,
+                result.returncode,
+                private_stdout,
+                private_stderr,
+                output_complete=output_complete,
+            )
+            receipt = _promote_receipt_for_activity(
+                receipt, observed_activity=spooled_activity is True
+            )
+            unstructured_detail = private_stderr or private_stdout
             if provider == "openai":
                 if result_is_spooled:
                     stdout_error = _extract_codex_jsonl_error_from_lines(
@@ -8396,16 +9829,50 @@ def _run_with_provider(
                 )
                 codex_auth_message = _codex_auth_failure_message(combined_error)
                 if codex_auth_message:
-                    return False, codex_auth_message, 0.0, None
-                if stdout_error:
-                    return False, f"Exit code {result.returncode}: {stdout_error}", 0.0, None
-                if stderr_snippet and not _is_codex_stdin_notice(stderr_snippet):
-                    error_detail = stderr_snippet
+                    receipt = _new_provider_attempt_receipt(
+                        provider,
+                        attempt_number,
+                        "credential_or_account",
+                        receipt.work_disposition,
+                    )
+                    public_codex_error = _sanitize_comment_body(
+                        codex_auth_message,
+                        max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                    )
+                elif stdout_error:
+                    public_codex_error = _sanitize_comment_body(
+                        f"Exit code {result.returncode}: {stdout_error}",
+                        max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                    )
+                elif stderr_snippet and not _is_codex_stdin_notice(stderr_snippet):
+                    public_codex_error = _sanitize_comment_body(
+                        f"Exit code {result.returncode}: {stderr_snippet}",
+                        max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                    )
                 else:
-                    error_detail = (stdout_snippet or stderr_snippet)[:MAX_ERROR_SNIPPET_LENGTH]
-                return False, f"Exit code {result.returncode}: {error_detail}", 0.0, None
-            error_detail = result.stderr or result.stdout[:500]
-            return False, f"Exit code {result.returncode}: {error_detail}", 0.0, None
+                    public_codex_error = _public_provider_failure_detail(
+                        receipt, result.returncode
+                    )
+                return _ProviderRunResult(
+                    False,
+                    public_codex_error,
+                    0.0,
+                    None,
+                    provider_attempt_receipt=receipt,
+                    classification_detail=combined_error,
+                )
+            return _ProviderRunResult(
+                False,
+                _public_provider_failure_detail(
+                    receipt,
+                    result.returncode,
+                    unstructured_detail,
+                ),
+                0.0,
+                None,
+                provider_attempt_receipt=receipt,
+                classification_detail=unstructured_detail,
+            )
 
         # OpenCode: parse JSONL output via the dedicated parser. OpenCode emits a
         # different event schema than Codex/Claude (step_start, text, step_finish,
@@ -8413,6 +9880,10 @@ def _run_with_provider(
         # belong in the shared single-JSON / Codex-NDJSON path below.
         if provider == "opencode":
             parsed = _parse_opencode_jsonl(result.stdout)
+            opencode_evidence_trustworthy = bool(
+                parsed.get("evidence_trustworthy", False)
+            )
+            opencode_observed_activity = bool(parsed.get("observed_activity", False))
             actual_model = parsed.get("model") or None
             err = parsed.get("error") or ""
             # Cost: prefer JSONL-reported cost; fall back to CSV pricing when
@@ -8430,12 +9901,38 @@ def _run_with_provider(
                 # provider failure inside OpenCode (e.g., "provider not
                 # configured"). Surface as failure, but keep cost and any
                 # captured model so callers can audit partial spend.
-                return False, str(err), cost, actual_model
-            return (
+                receipt = _create_provider_attempt_receipt(
+                    provider,
+                    attempt_number,
+                    result.returncode,
+                    result.stdout or "",
+                    result.stderr or "",
+                )
+                receipt = _promote_receipt_for_activity(
+                    receipt,
+                    cost=cost,
+                    usage=parsed.get("tokens"),
+                    observed_activity=bool(parsed.get("text")),
+                )
+                return _ProviderRunResult(
+                    False,
+                    _sanitize_comment_body(
+                        str(err), max_chars=MAX_ERROR_SNIPPET_LENGTH
+                    ),
+                    cost,
+                    actual_model,
+                    provider_attempt_receipt=receipt,
+                    classification_detail=str(err),
+                    evidence_trustworthy=opencode_evidence_trustworthy,
+                )
+            return _ProviderRunResult(
                 True,
                 str(parsed.get("text") or ""),
                 cost,
                 actual_model,
+                parsed.get("tokens"),
+                evidence_trustworthy=opencode_evidence_trustworthy,
+                observed_activity=opencode_observed_activity is True,
             )
 
         # Diagnostic: capture when CLI exits 0 with empty / whitespace-only stdout.
@@ -8478,7 +9975,23 @@ def _run_with_provider(
                 text.startswith("Error:")
                 or text.startswith("Authentication required.")
             ):
-                return False, text[:MAX_ERROR_SNIPPET_LENGTH], 0.0, None
+                receipt = _create_provider_attempt_receipt(
+                    provider,
+                    attempt_number,
+                    result.returncode,
+                    result.stdout or "",
+                    result.stderr or "",
+                )
+                return _ProviderRunResult(
+                    False,
+                    _sanitize_comment_body(
+                        text, max_chars=MAX_ERROR_SNIPPET_LENGTH
+                    ),
+                    0.0,
+                    None,
+                    provider_attempt_receipt=receipt,
+                    classification_detail=text,
+                )
             return True, text, 0.0, None
 
         # Parse JSON Output
@@ -8488,14 +10001,38 @@ def _run_with_provider(
             # the in-RAM string.
             output_str = "" if result_is_spooled else result.stdout.strip()
             data: Dict[str, Any] = {}
+            structured_evidence_trustworthy = True
+            structured_observed_activity = False
 
             if provider == "openai" and result_is_spooled:
-                data = _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
+                codex_observed_activity = _codex_jsonl_has_observed_activity(
+                    _iter_spooled_lines(result.stdout_file)
+                )
+                structured_evidence_trustworthy = codex_observed_activity is not None
+                structured_observed_activity = codex_observed_activity is True
+                data = (
+                    _parse_codex_jsonl(_iter_spooled_lines(result.stdout_file))
+                    if structured_evidence_trustworthy
+                    else {}
+                )
                 if not data:
                     raise json.JSONDecodeError("No JSON", result.stdout_tail[:200], 0)
-            elif provider == "openai" and "\n" in output_str:
-                data = _parse_codex_jsonl(output_str.splitlines())
+            elif provider == "openai":
+                codex_observed_activity = _codex_jsonl_has_observed_activity(
+                    iter(output_str.splitlines())
+                )
+                structured_evidence_trustworthy = codex_observed_activity is not None
+                structured_observed_activity = codex_observed_activity is True
+                data = (
+                    _parse_codex_jsonl(output_str.splitlines())
+                    if structured_evidence_trustworthy
+                    else {}
+                )
             else:
+                try:
+                    _strict_json_object(output_str)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    structured_evidence_trustworthy = False
                 # Claude Code may emit non-JSON text to stdout (npm warnings,
                 # upgrade prompts) alongside the JSON result.  Try parsing as
                 # single JSON first, then fall back to line-by-line extraction.
@@ -8522,15 +10059,45 @@ def _run_with_provider(
                     f"JSON keys: {sorted(data.keys())}[/dim]"
                 )
             if provider == "anthropic":
+                receipt = (
+                    _create_provider_attempt_receipt(
+                        provider,
+                        attempt_number,
+                        result.returncode,
+                        output_str,
+                        result.stderr or "",
+                    )
+                    if not success
+                    else None
+                )
+                if receipt is not None and not isinstance(data, dict):
+                    public_text = (
+                        "Error parsing anthropic JSON: response was not an object"
+                    )
+                elif receipt is not None:
+                    provider_detail = data.get("result")
+                    if isinstance(provider_detail, str) and provider_detail:
+                        public_text = _sanitize_comment_body(
+                            provider_detail, max_chars=MAX_ERROR_SNIPPET_LENGTH
+                        )
+                    else:
+                        public_text = _public_provider_failure_detail(
+                            receipt, result.returncode
+                        )
+                else:
+                    public_text = text
                 return _ProviderRunResult(
                     success,
-                    text,
+                    public_text,
                     cost,
                     actual_model,
                     _extract_anthropic_standard_usage(
                         data,
                         actual_model=actual_model,
                     ),
+                    provider_attempt_receipt=receipt,
+                    classification_detail=text if not success else None,
+                    evidence_trustworthy=structured_evidence_trustworthy,
                 )
             if provider == "openai":
                 raw_usage = data.get("usage") if isinstance(data, dict) else None
@@ -8547,21 +10114,53 @@ def _run_with_provider(
                     raw_usage if isinstance(raw_usage, dict) else None,
                     effective_codex_effort,
                     effective_codex_effort,
+                    evidence_trustworthy=structured_evidence_trustworthy,
+                    observed_activity=structured_observed_activity,
                 )
-            return success, text, cost, actual_model
-        except json.JSONDecodeError:
-            # Fallback if CLI didn't output valid JSON (sometimes happens on
-            # crash). Use HEAD+TAIL for spooled results: _read_spool_snippets
-            # returns tail="" for files <=64KiB, so short invalid output would
-            # otherwise yield an empty diagnostic.
-            snippet = (
-                _bounded_head_tail(
-                    result.stdout_head, result.stdout_tail, MAX_ERROR_SNIPPET_LENGTH
-                )
-                if result_is_spooled
-                else result.stdout[:MAX_ERROR_SNIPPET_LENGTH]
+            return _ProviderRunResult(
+                success,
+                text,
+                cost,
+                actual_model,
+                evidence_trustworthy=structured_evidence_trustworthy,
             )
-            return False, f"Invalid JSON output: {snippet}...", 0.0, None
+        except (
+            json.JSONDecodeError,
+            OverflowError,
+            RecursionError,
+            TypeError,
+            ValueError,
+        ):
+            # Invalid or incomplete provider output never becomes a public raw
+            # snippet; retain only its fail-closed receipt classification.
+            receipt = _create_provider_attempt_receipt(
+                provider,
+                attempt_number,
+                getattr(result, "returncode", 1),
+                "" if result_is_spooled else (result.stdout or ""),
+                "" if result_is_spooled else (result.stderr or ""),
+                output_complete=not result_is_spooled,
+            )
+            invalid_stdout = "" if result_is_spooled else (result.stdout or "")
+            if isinstance(invalid_stdout, str) and not invalid_stdout.lstrip().startswith(
+                ("{", "[")
+            ):
+                public_invalid_json = _sanitize_comment_body(
+                    f"Invalid JSON output: {invalid_stdout}",
+                    max_chars=MAX_ERROR_SNIPPET_LENGTH,
+                )
+            else:
+                public_invalid_json = _public_provider_failure_detail(
+                    receipt, getattr(result, "returncode", None)
+                )
+            return _ProviderRunResult(
+                False,
+                public_invalid_json,
+                0.0,
+                None,
+                provider_attempt_receipt=receipt,
+                classification_detail=invalid_stdout,
+            )
     finally:
         if result_is_spooled:
             result.close()

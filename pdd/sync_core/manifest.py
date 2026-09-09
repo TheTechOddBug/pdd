@@ -162,6 +162,27 @@ _BOOTSTRAP_HUMAN_OWNERSHIP = (
         True,
     ),
     OwnershipRule(
+        "tests/test_provider_attempt_outcome.py",
+        InventoryStatus.HUMAN_OWNED,
+        "human-maintained",
+        "pdd-maintainers",
+        True,
+    ),
+    OwnershipRule(
+        "tests/test_provider_attempt_outcome_codex.py",
+        InventoryStatus.HUMAN_OWNED,
+        "human-maintained",
+        "pdd-maintainers",
+        True,
+    ),
+    OwnershipRule(
+        "tests/test_provider_attempt_outcome_opencode.py",
+        InventoryStatus.HUMAN_OWNED,
+        "human-maintained",
+        "pdd-maintainers",
+        True,
+    ),
+    OwnershipRule(
         ".pdd/meta/agentic_architecture_python.json",
         InventoryStatus.HUMAN_OWNED,
         "human-maintained",
@@ -353,7 +374,7 @@ _REPLAY_HUMAN_OWNERSHIP = tuple(
 # lose their repaired ownership, and they resurface as unowned tracked paths.
 _SYNC_ROLLOUT_REPAIR_OWNERSHIP_BYTES = (
     "8f5762a5dd7be6cc14c85138810b8bad8183f4403c74584489a0d81798ba2a07",
-    "02ec8e64eb1009a03070d8236ee44943250df4f6d6aab0ef09be5252d983d2fb",
+    "e9e6226757adeb91d011c3f0fd2d7dcb579a7c3cadf15cb5210c2032ec8f46c7",
 )
 # Re-pinning above only tracks the current head. The repair is also replayed
 # across its own protected range, whose head predates every later edit to the
